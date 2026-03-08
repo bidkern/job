@@ -23,7 +23,17 @@ while ($true) {
         & $syncScript -RepoRoot $RepoRoot -Message "$MessagePrefix $stamp"
     }
     catch {
-        Write-Warning $_.Exception.Message
+        $message = $_.Exception.Message
+        Write-Warning $message
+        if (
+            $message -match "placeholder URL" -or
+            $message -match "No git remote" -or
+            $message -match "Git author identity is missing" -or
+            $message -match "not a git repository"
+        ) {
+            Write-Warning "Auto-sync stopped because the git configuration is incomplete."
+            break
+        }
     }
 
     Start-Sleep -Seconds $IntervalSeconds
