@@ -2,7 +2,7 @@
 
 import { startTransition, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { Clipboard, ExternalLink, Search, SkipForward, WandSparkles } from "lucide-react";
+import { Clipboard, ExternalLink, RefreshCcw, Search, SkipForward, WandSparkles } from "lucide-react";
 
 import { ScoreWhyPopover } from "@/components/score-why-popover";
 import { StatusBadge } from "@/components/status-badge";
@@ -86,6 +86,12 @@ function refreshBadgeLabel(scopeState) {
   return "Idle";
 }
 
+function refreshCountLabel(scopeState) {
+  const count = Number(scopeState?.items_written || 0);
+  if (!Number.isFinite(count) || count <= 0) return "0 jobs";
+  return `${count} job${count === 1 ? "" : "s"} last run`;
+}
+
 function formatDateTime(value) {
   if (!value) return "Never";
   const dt = new Date(value);
@@ -97,6 +103,32 @@ function formatMoney(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return `$${Math.round(n).toLocaleString()}`;
+}
+
+function renderMatchSnippet(snippet) {
+  const normalized = String(snippet || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  const parts = normalized.split(/(\[\[.*?\]\])/g).filter(Boolean);
+  return (
+    <div className="mt-2 rounded-md border border-dashed px-2 py-1 text-[11px] text-muted-foreground">
+      <span className="font-medium text-foreground">Match snippet:</span>{" "}
+      {parts.map((part, index) => {
+        const highlighted = part.startsWith("[[") && part.endsWith("]]");
+        const value = highlighted ? part.slice(2, -2) : part;
+        if (!value) return null;
+        return highlighted ? (
+          <mark
+            key={`${value}-${index}`}
+            className="rounded bg-amber-300/60 px-0.5 text-foreground dark:bg-amber-500/20"
+          >
+            {value}
+          </mark>
+        ) : (
+          <span key={`${value}-${index}`}>{value}</span>
+        );
+      })}
+    </div>
+  );
 }
 
 function compatibilityScore10(job) {
@@ -343,6 +375,7 @@ export default function JobsPage() {
   const [errorLocal, setErrorLocal] = useState("");
   const [errorNationwide, setErrorNationwide] = useState("");
   const [notice, setNotice] = useState("");
+  const [queueingRefresh, setQueueingRefresh] = useState(false);
 
   const [sprintQueueIds, setSprintQueueIds] = useState([]);
   const [sprintIndex, setSprintIndex] = useState(0);
@@ -414,6 +447,49 @@ export default function JobsPage() {
       setRefreshStatus(status || { last_source_refresh_at: null, scopes: [] });
     } catch {
       // Keep UI usable if refresh-state polling fails.
+    }
+  };
+
+  const queueRefreshSources = async () => {
+    setQueueingRefresh(true);
+    try {
+      const response = await api.queueRefreshSources({
+        query: String(query || "").trim() || null,
+        base_zip: String(baseZip || "").trim() || null,
+        max_distance: parsePositiveNumber(maxDistance),
+        min_salary: parsePositiveNumber(minSalary),
+        local_remote_type: localRemoteType,
+        nationwide_remote_type: nationwideRemoteType,
+        city: String(nationwideCity || "").trim() || null,
+        state: String(nationwideState || "").trim() || null,
+        zip_code: String(nationwideZip || "").trim() || null,
+        min_interview_score_10: parseBoundedScore(minInterviewNationwide, 5.5),
+        min_compatibility_score_10: parseBoundedScore(minCompatibilityNationwide, 6.5),
+        local_pages: LOCAL_PAGES,
+        local_limit: LOCAL_LIMIT,
+        nationwide_limit: NATIONWIDE_LIMIT,
+        refresh_local: true,
+        refresh_nationwide: true,
+      });
+      const queued = Array.isArray(response?.queued_scopes) ? response.queued_scopes : [];
+      const busy = Array.isArray(response?.already_running_scopes) ? response.already_running_scopes : [];
+      if (queued.length > 0) {
+        setNotice(
+          `Queued ${queued.join(" + ").replace(/_/g, " ")} refresh. Current jobs stay visible while sources update in the background.`
+        );
+      } else if (busy.length > 0) {
+        setNotice(`Refresh already in progress for ${busy.join(" + ").replace(/_/g, " ")}.`);
+      } else {
+        setNotice("No refresh scopes were queued.");
+      }
+      await loadRefreshStatus();
+      setTimeout(() => {
+        void loadRefreshStatus();
+      }, 1200);
+    } catch (e) {
+      setNotice(e.message || "Could not queue source refresh.");
+    } finally {
+      setQueueingRefresh(false);
     }
   };
 
@@ -820,9 +896,12 @@ export default function JobsPage() {
               <CardDescription>{subtitle}</CardDescription>
             </div>
             {refreshState ? (
-              <Badge variant={refreshBadgeVariant(refreshState)}>
-                {refreshState.label}: {refreshBadgeLabel(refreshState)}
-              </Badge>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant={refreshBadgeVariant(refreshState)}>
+                  {refreshState.label}: {refreshBadgeLabel(refreshState)}
+                </Badge>
+                <span className="text-[11px] text-muted-foreground">{refreshCountLabel(refreshState)}</span>
+              </div>
             ) : null}
           </div>
         </CardHeader>
@@ -912,6 +991,7 @@ export default function JobsPage() {
                           )}
                         </div>
                         <div className="text-xs text-muted-foreground">{job.location_text || "Location not listed"}</div>
+                        {renderMatchSnippet(job.match_snippet)}
                       </div>
                     </div>
                     <StatusBadge status={job.status} />
@@ -1021,12 +1101,12 @@ export default function JobsPage() {
           </span>
           {localRefreshState ? (
             <Badge variant={refreshBadgeVariant(localRefreshState)}>
-              Local: {refreshBadgeLabel(localRefreshState)}
+              Local: {refreshBadgeLabel(localRefreshState)} · {refreshCountLabel(localRefreshState)}
             </Badge>
           ) : null}
           {nationwideRefreshState ? (
             <Badge variant={refreshBadgeVariant(nationwideRefreshState)}>
-              Nationwide: {refreshBadgeLabel(nationwideRefreshState)}
+              Nationwide: {refreshBadgeLabel(nationwideRefreshState)} · {refreshCountLabel(nationwideRefreshState)}
             </Badge>
           ) : null}
         </div>
@@ -1090,6 +1170,10 @@ export default function JobsPage() {
             <Button className="gap-2" onClick={searchJobs}>
               <Search className="h-4 w-4" />
               Search Jobs
+            </Button>
+            <Button variant="outline" className="gap-2" onClick={queueRefreshSources} disabled={queueingRefresh}>
+              <RefreshCcw className={`h-4 w-4 ${queueingRefresh ? "animate-spin" : ""}`} />
+              {queueingRefresh ? "Queueing Refresh..." : "Refresh Sources Now"}
             </Button>
             <Button
               variant="outline"

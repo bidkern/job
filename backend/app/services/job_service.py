@@ -195,6 +195,49 @@ def _build_fts_match_query(raw_query: str) -> str | None:
     return " OR ".join(dict.fromkeys(parts))
 
 
+def get_job_match_snippets(db: Session, raw_query: str, limit: int = 200) -> dict[int, str]:
+    match_query = _build_fts_match_query(str(raw_query or ""))
+    if not match_query or not _jobs_fts_available(db):
+        return {}
+
+    try:
+        search_limit = max(20, min(500, int(limit)))
+    except (TypeError, ValueError):
+        search_limit = 200
+
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT
+                    rowid,
+                    snippet(jobs_fts, 3, '[[', ']]', ' ... ', 18) AS description_snippet,
+                    snippet(jobs_fts, -1, '[[', ']]', ' ... ', 18) AS best_snippet
+                FROM jobs_fts
+                WHERE jobs_fts MATCH :match_query
+                ORDER BY bm25(jobs_fts, 8.0, 5.0, 2.0, 1.0)
+                LIMIT :search_limit
+                """
+            ),
+            {"match_query": match_query, "search_limit": search_limit},
+        ).all()
+    except Exception:
+        return {}
+
+    snippets: dict[int, str] = {}
+    for rowid, description_snippet, best_snippet in rows:
+        try:
+            job_id = int(rowid)
+        except (TypeError, ValueError):
+            continue
+        snippet_text = str(description_snippet or "").strip()
+        if "[[" not in snippet_text or "]]" not in snippet_text:
+            snippet_text = str(best_snippet or "").strip()
+        if snippet_text:
+            snippets[job_id] = snippet_text
+    return snippets
+
+
 def _list_jobs_fts(db: Session, filters: dict) -> list[Job]:
     match_query = _build_fts_match_query(str(filters.get("q") or ""))
     if not match_query or not _jobs_fts_available(db):

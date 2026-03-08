@@ -27,12 +27,14 @@ from app.schemas.job import (
     MaterialRequest,
     MaterialResponse,
     NationwideRecommendationRequest,
+    RefreshNowRequest,
+    RefreshNowResponse,
     RefreshScopeRead,
     RefreshStatusResponse,
     RescoreAllResponse,
 )
 from app.services import ingestion
-from app.services.job_service import create_or_update_job, get_dashboard_metrics, list_jobs
+from app.services.job_service import create_or_update_job, get_dashboard_metrics, get_job_match_snippets, list_jobs
 from app.services.distance import ZIP_CITY_STATE, distance_from_base_zip, infer_zip_from_location
 from app.services.extraction import extract_skills
 from app.services.materials import generate_materials
@@ -848,6 +850,73 @@ def _serialize_refresh_state_rows(db: Session) -> RefreshStatusResponse:
     return RefreshStatusResponse(last_source_refresh_at=last_source_refresh_at, scopes=scopes)
 
 
+def _attach_match_snippets(db: Session, rows: list[JobRead], query: str | None) -> list[JobRead]:
+    normalized_query = " ".join(str(query or "").strip().split())
+    if not normalized_query or not rows:
+        return rows
+    snippets = get_job_match_snippets(db, normalized_query, limit=max(50, len(rows) * 4))
+    query_tokens = [
+        token
+        for token in dict.fromkeys(re.findall(r"[a-z0-9+#]{2,}", normalized_query.lower()))
+        if len(token) >= 2
+    ]
+    if not snippets and not query_tokens:
+        return rows
+
+    def _highlight_text(text: str) -> str:
+        highlighted = text
+        for token in sorted(query_tokens, key=len, reverse=True):
+            highlighted = re.sub(
+                rf"(?i)\b({re.escape(token)})\b",
+                lambda match: f"[[{match.group(0)}]]",
+                highlighted,
+            )
+        return highlighted
+
+    def _fallback_snippet(row: JobRead) -> str | None:
+        if not query_tokens:
+            return None
+        candidates = [
+            row.clean_description,
+            row.description,
+            row.title,
+            row.company,
+            row.location_text,
+        ]
+        for candidate in candidates:
+            text = " ".join(str(candidate or "").split())
+            if not text:
+                continue
+            lower = text.lower()
+            match_index = min((lower.find(token) for token in query_tokens if token in lower), default=-1)
+            if match_index < 0:
+                continue
+            start = max(0, match_index - 90)
+            end = min(len(text), match_index + 180)
+            excerpt = text[start:end].strip()
+            if start > 0:
+                excerpt = f"... {excerpt}"
+            if end < len(text):
+                excerpt = f"{excerpt} ..."
+            highlighted = _highlight_text(excerpt)
+            if highlighted.strip():
+                return highlighted
+        return None
+
+    if not snippets:
+        out: list[JobRead] = []
+        for row in rows:
+            fallback = _fallback_snippet(row)
+            out.append(row.model_copy(update={"match_snippet": fallback}) if fallback else row)
+        return out
+
+    out: list[JobRead] = []
+    for row in rows:
+        match_snippet = snippets.get(row.id) or _fallback_snippet(row)
+        out.append(row.model_copy(update={"match_snippet": match_snippet}) if match_snippet else row)
+    return out
+
+
 @router.get("", response_model=list[JobRead])
 def get_jobs(
     q: str | None = None,
@@ -876,7 +945,7 @@ def get_jobs(
     remote_pref = (remote_type or "any").lower().strip()
     if remote_pref not in {"any", "local", "remote", "onsite", "hybrid"}:
         remote_pref = "any"
-    return _filter_serialized_rows(
+    result = _filter_serialized_rows(
         rows=serialized,
         remote_pref=remote_pref,
         min_salary=None,
@@ -885,11 +954,77 @@ def get_jobs(
         profile_skills=profile_skills,
         profile_hobbies=profile_hobbies,
     )
+    return _attach_match_snippets(db, result, q)
 
 
 @router.get("/refresh-status", response_model=RefreshStatusResponse)
 def get_refresh_status(db: Session = Depends(get_db)):
     return _serialize_refresh_state_rows(db)
+
+
+@router.post("/refresh-sources", response_model=RefreshNowResponse)
+def refresh_sources_now(req: RefreshNowRequest, db: Session = Depends(get_db)):
+    if not req.refresh_local and not req.refresh_nationwide:
+        raise HTTPException(status_code=400, detail="At least one refresh scope must be enabled")
+
+    queued_scopes: list[str] = []
+    already_running_scopes: list[str] = []
+
+    if req.refresh_local:
+        local_req = JobSearchRequest(
+            query=req.query,
+            base_zip=req.base_zip,
+            max_distance=req.max_distance,
+            min_salary=req.min_salary,
+            remote_type=req.local_remote_type,
+            salary_required=True,
+            exclude_confidential=True,
+            pages=req.local_pages,
+            limit=req.local_limit,
+            refresh_pool=True,
+        )
+        queued = enqueue_refresh(
+            _refresh_queue_key("search", local_req.model_dump(mode="python")),
+            _refresh_search_pool_async,
+            local_req.model_dump(mode="python"),
+        )
+        if queued:
+            mark_refresh_queued("local_search")
+            queued_scopes.append("local_search")
+        else:
+            already_running_scopes.append("local_search")
+
+    if req.refresh_nationwide:
+        national_req = NationwideRecommendationRequest(
+            query=req.query,
+            city=req.city,
+            state=req.state,
+            zip_code=req.zip_code,
+            base_zip=req.base_zip,
+            max_distance=req.max_distance,
+            min_salary=req.min_salary,
+            remote_type=req.nationwide_remote_type,
+            salary_required=True,
+            exclude_confidential=True,
+            min_interview_score_10=req.min_interview_score_10,
+            min_compatibility_score_10=req.min_compatibility_score_10,
+            limit=req.nationwide_limit,
+            pages_per_region=1,
+            refresh_pool=True,
+            adaptive_thresholds=True,
+        )
+        queued = enqueue_refresh(
+            _refresh_queue_key("national", national_req.model_dump(mode="python")),
+            _refresh_national_pool_async,
+            national_req.model_dump(mode="python"),
+        )
+        if queued:
+            mark_refresh_queued("nationwide")
+            queued_scopes.append("nationwide")
+        else:
+            already_running_scopes.append("nationwide")
+
+    return RefreshNowResponse(queued_scopes=queued_scopes, already_running_scopes=already_running_scopes)
 
 
 @router.post("/search", response_model=list[JobRead])
@@ -1017,7 +1152,7 @@ async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
                 )
             )
         diversified = _diversify_rows_by_company(filtered, max_per_company_first_pass=3 if query else 2)
-        result = diversified[:limit]
+        result = _attach_match_snippets(db, diversified[:limit], query)
         if not req.refresh_pool:
             jobs_query_cache.set("search", cache_params, [row.model_dump(mode="json") for row in result])
         return result
@@ -1293,7 +1428,7 @@ async def nationwide_recommendations(req: NationwideRecommendationRequest, db: S
         )
     )
     diversified = _diversify_rows_by_company(ranked, max_per_company_first_pass=1 if nationwide_scope else 2)
-    result = diversified[: req.limit]
+    result = _attach_match_snippets(db, diversified[: req.limit], query)
     if not req.refresh_pool:
         jobs_query_cache.set("recommendations_national", cache_params, [row.model_dump(mode="json") for row in result])
     return result

@@ -63,6 +63,8 @@ export const api = {
   generateMaterials: (id, body) => request(`/jobs/${id}/materials`, { method: "POST", body: JSON.stringify(body) }),
   getMetrics: () => request("/jobs/dashboard/metrics"),
   getRefreshStatus: () => request("/jobs/refresh-status"),
+  queueRefreshSources: (body) =>
+    request("/jobs/refresh-sources", { method: "POST", body: JSON.stringify(body), timeoutMs: 10000 }),
   ingest: (body) => request("/jobs/ingest", { method: "POST", body: JSON.stringify(body) }),
   searchJobs: (body) => request("/jobs/search", { method: "POST", body: JSON.stringify(body), timeoutMs: 30000 }),
   discoverCompanySites: (body) => request("/jobs/discover-company-sites", { method: "POST", body: JSON.stringify(body) }),

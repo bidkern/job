@@ -51,6 +51,7 @@ class JobUpdate(BaseModel):
 class JobRead(JobBase):
     id: int
     clean_description: str | None = None
+    match_snippet: str | None = None
     interview_score: float | None = None
     potential_match_score: float | None = None
     compatibility_score_10: float | None = None
@@ -190,3 +191,27 @@ class RefreshScopeRead(BaseModel):
 class RefreshStatusResponse(BaseModel):
     last_source_refresh_at: datetime | None = None
     scopes: list[RefreshScopeRead] = Field(default_factory=list)
+
+
+class RefreshNowRequest(BaseModel):
+    query: str | None = None
+    base_zip: str | None = None
+    max_distance: float | None = None
+    min_salary: float | None = None
+    local_remote_type: str = "local"
+    nationwide_remote_type: str = "any"
+    city: str | None = None
+    state: str | None = None
+    zip_code: str | None = None
+    min_interview_score_10: float = Field(default=5.5, ge=0, le=10)
+    min_compatibility_score_10: float = Field(default=6.5, ge=0, le=10)
+    local_pages: int = Field(default=4, ge=1, le=6)
+    local_limit: int = Field(default=160, ge=1, le=300)
+    nationwide_limit: int = Field(default=25, ge=1, le=100)
+    refresh_local: bool = True
+    refresh_nationwide: bool = True
+
+
+class RefreshNowResponse(BaseModel):
+    queued_scopes: list[str] = Field(default_factory=list)
+    already_running_scopes: list[str] = Field(default_factory=list)
