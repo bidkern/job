@@ -16,6 +16,9 @@ from app.models.job_material import JobMaterial
 from app.models.profile import UserProfile
 from app.models.job_source import JobSource
 from app.schemas.job import (
+    BatchMaterialPacket,
+    BatchMaterialRequest,
+    BatchMaterialResponse,
     BulkActionRequest,
     BulkActionResponse,
     CompanySiteDiscoverRequest,
@@ -51,7 +54,9 @@ from app.services.refresh_state import (
 from app.services.constants import (
     AGGRESSIVE_GREENHOUSE_TOKENS,
     AGGRESSIVE_LEVER_SLUGS,
+    AGGRESSIVE_LOCAL_SEARCH_TERMS,
     AGGRESSIVE_MUSE_CATEGORIES,
+    AGGRESSIVE_NATIONAL_SEARCH_TERMS,
     CONTIGUOUS_US_STATES,
     HOBBY_JOB_SIGNALS,
     SOURCE_TRUST,
@@ -129,10 +134,20 @@ def _default_search_locations(base_zip: str | None) -> list[str]:
                         "Hudson, OH",
                         "Twinsburg, OH",
                         "Aurora, OH",
+                        "Macedonia, OH",
+                        "Streetsboro, OH",
+                        "Solon, OH",
+                        "Beachwood, OH",
+                        "Brecksville, OH",
                         "Tallmadge, OH",
                         "Canton, OH",
+                        "North Canton, OH",
+                        "Massillon, OH",
                         "Medina, OH",
+                        "Brunswick, OH",
                         "Strongsville, OH",
+                        "Parma, OH",
+                        "Willoughby, OH",
                         "Wooster, OH",
                         "Youngstown, OH",
                         "Columbus, OH",
@@ -475,7 +490,7 @@ async def _refresh_search_pool_async(payload: dict[str, Any]) -> None:
             except Exception:
                 continue
 
-        fallback_locations = locations if query else locations[:3]
+        fallback_locations = locations if query else locations[:5]
         for location in fallback_locations:
             for page in range(1, min(pages, 10 if aggressive_mode else 5) + 1):
                 try:
@@ -501,37 +516,39 @@ async def _refresh_search_pool_async(payload: dict[str, Any]) -> None:
                         except Exception:
                             continue
 
-            if query:
-                for token in AGGRESSIVE_GREENHOUSE_TOKENS:
-                    try:
-                        _queue(lambda token=token: ingestion.fetch_greenhouse(token), 6.0)
-                    except Exception:
-                        continue
-                for slug in AGGRESSIVE_LEVER_SLUGS:
-                    try:
-                        _queue(lambda slug=slug: ingestion.fetch_lever(slug), 6.0)
-                    except Exception:
-                        continue
-
-        if settings.adzuna_app_id and settings.adzuna_app_key:
-            where = requested_zip or "United States"
-            for page in range(1, min(4 if aggressive_mode else 2, pages) + 1):
+            greenhouse_tokens = AGGRESSIVE_GREENHOUSE_TOKENS if query else AGGRESSIVE_GREENHOUSE_TOKENS[:8]
+            lever_slugs = AGGRESSIVE_LEVER_SLUGS if query else AGGRESSIVE_LEVER_SLUGS[:8]
+            for token in greenhouse_tokens:
                 try:
-                    what = query or "jobs"
-                    _queue(
-                        lambda where=where, what=what, page=page: ingestion.fetch_adzuna(
-                            settings.adzuna_app_id,
-                            settings.adzuna_app_key,
-                            where=where,
-                            what=what,
-                            page=page,
-                        ),
-                        7.0,
-                    )
+                    _queue(lambda token=token: ingestion.fetch_greenhouse(token), 6.0 if query else 5.0)
+                except Exception:
+                    continue
+            for slug in lever_slugs:
+                try:
+                    _queue(lambda slug=slug: ingestion.fetch_lever(slug), 6.0 if query else 5.0)
                 except Exception:
                     continue
 
-        max_tasks = 72 if (aggressive_mode and query) else (48 if query else 24)
+        if settings.adzuna_app_id and settings.adzuna_app_key:
+            where = requested_zip or "United States"
+            search_terms = [query] if query else AGGRESSIVE_LOCAL_SEARCH_TERMS[:4]
+            for what in search_terms:
+                for page in range(1, min(4 if aggressive_mode else 2, pages) + 1):
+                    try:
+                        _queue(
+                            lambda where=where, what=what, page=page: ingestion.fetch_adzuna(
+                                settings.adzuna_app_id,
+                                settings.adzuna_app_key,
+                                where=where,
+                                what=what,
+                                page=page,
+                            ),
+                            7.0,
+                        )
+                    except Exception:
+                        continue
+
+        max_tasks = 72 if (aggressive_mode and query) else (56 if aggressive_mode else (48 if query else 32))
         if len(pending_fetches) > max_tasks:
             pending_fetches = pending_fetches[:max_tasks]
 
@@ -695,18 +712,19 @@ async def _refresh_national_pool_async(payload: dict[str, Any]) -> None:
                         )
             if settings.adzuna_app_id and settings.adzuna_app_key:
                 max_adzuna_pages = 1 if nationwide_scope else min(2, pages_per_region)
-                for page in range(1, max_adzuna_pages + 1):
-                    what = query or "jobs"
-                    _queue(
-                        lambda location=location, what=what, page=page: ingestion.fetch_adzuna(
-                            settings.adzuna_app_id,
-                            settings.adzuna_app_key,
-                            where=location,
-                            what=what,
-                            page=page,
-                        ),
-                        9.0,
-                    )
+                search_terms = [query] if query else AGGRESSIVE_NATIONAL_SEARCH_TERMS[: (3 if nationwide_scope else 2)]
+                for what in search_terms:
+                    for page in range(1, max_adzuna_pages + 1):
+                        _queue(
+                            lambda location=location, what=what, page=page: ingestion.fetch_adzuna(
+                                settings.adzuna_app_id,
+                                settings.adzuna_app_key,
+                                where=location,
+                                what=what,
+                                page=page,
+                            ),
+                            9.0,
+                        )
 
         for token in AGGRESSIVE_GREENHOUSE_TOKENS:
             _queue(lambda token=token: ingestion.fetch_greenhouse(token), 8.0)
@@ -1619,6 +1637,162 @@ def rescore_all_jobs(db: Session = Depends(get_db)):
     )
 
 
+def _job_material_payload(material: JobMaterial) -> dict[str, Any]:
+    return {
+        "ats_keywords": json.loads(material.ats_keywords or "[]"),
+        "resume_bullet_suggestions": json.loads(material.resume_bullet_suggestions or "[]"),
+        "cover_letter_draft": material.cover_letter_draft,
+        "outreach_message_draft": material.outreach_message_draft,
+    }
+
+
+def _sanitize_material_inputs(
+    req: MaterialRequest,
+    blocked_hobbies: set[str],
+) -> tuple[list[str], list[str]]:
+    def _remove_hobby_terms(values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in values:
+            term = _normalize_phrase(raw)
+            if term and term in blocked_hobbies:
+                continue
+            cleaned.append(raw)
+        return cleaned
+
+    return _remove_hobby_terms(req.profile_skills), _remove_hobby_terms(req.experience_areas)
+
+
+def _packet_text_from_materials(job: Job, data: dict[str, Any]) -> str:
+    ats = list(data.get("ats_keywords") or [])[:20]
+    bullets = list(data.get("resume_bullet_suggestions") or [])[:6]
+    cover = data.get("cover_letter_draft") or ""
+    outreach = data.get("outreach_message_draft") or ""
+    lines = [
+        f"Job: {job.title or '-'}",
+        f"Company: {job.company or '-'}",
+        f"Location: {job.location_text or '-'}",
+        f"URL: {job.url or '-'}",
+        "",
+        "ATS Keywords:",
+        *[f"- {item}" for item in ats],
+        "",
+        "Resume Bullet Suggestions:",
+        *[f"- {item}" for item in bullets],
+        "",
+        "Short Cover Note:",
+        cover or "(none)",
+        "",
+        "Outreach Message:",
+        outreach or "(none)",
+    ]
+    return "\n".join(lines)
+
+
+async def _load_or_generate_material_payload(
+    job: Job,
+    req: MaterialRequest,
+    db: Session,
+    *,
+    commit: bool,
+) -> tuple[dict[str, Any], bool]:
+    stored = db.query(JobMaterial).filter(JobMaterial.job_id == job.id).first()
+    if stored:
+        return _job_material_payload(stored), False
+
+    profile = _load_profile_record(db)
+    blocked_hobbies = {_normalize_phrase(x) for x in _load_profile_hobbies(db, profile)}
+    safe_profile_skills, safe_experience_areas = _sanitize_material_inputs(req, blocked_hobbies)
+    data = await generate_materials(
+        title=job.title,
+        company=job.company,
+        description=job.description,
+        profile_skills=safe_profile_skills,
+        experience_areas=safe_experience_areas,
+        include_cover_letter=req.include_cover_letter,
+    )
+    material = JobMaterial(
+        job_id=job.id,
+        ats_keywords=json.dumps(data.get("ats_keywords") or []),
+        resume_bullet_suggestions=json.dumps(data.get("resume_bullet_suggestions") or []),
+        cover_letter_draft=data.get("cover_letter_draft"),
+        outreach_message_draft=data.get("outreach_message_draft") or "",
+        openai_used=bool(data.get("openai_used")),
+        generated_at=datetime.utcnow(),
+    )
+    db.add(material)
+    if commit:
+        db.commit()
+        db.refresh(material)
+    else:
+        db.flush()
+    return _job_material_payload(material), True
+
+
+@router.post("/materials/batch", response_model=BatchMaterialResponse)
+async def materials_batch(req: BatchMaterialRequest, db: Session = Depends(get_db)):
+    ids: list[int] = []
+    seen_ids: set[int] = set()
+    for raw_id in req.ids:
+        try:
+            job_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if job_id > 0 and job_id not in seen_ids:
+            seen_ids.add(job_id)
+            ids.append(job_id)
+
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+
+    jobs = db.scalars(select(Job).where(Job.id.in_(ids))).all()
+    jobs_by_id = {job.id: job for job in jobs}
+    packets: list[BatchMaterialPacket] = []
+    generated_count = 0
+    material_req = MaterialRequest(
+        profile_skills=req.profile_skills,
+        experience_areas=req.experience_areas,
+        include_cover_letter=req.include_cover_letter,
+    )
+
+    try:
+        for job_id in ids:
+            job = jobs_by_id.get(job_id)
+            if not job:
+                continue
+            data, generated = await _load_or_generate_material_payload(job, material_req, db, commit=False)
+            if generated:
+                generated_count += 1
+            packets.append(
+                BatchMaterialPacket(
+                    job_id=job.id,
+                    title=job.title,
+                    company=job.company,
+                    url=job.url,
+                    packet_text=_packet_text_from_materials(job, data),
+                    ats_keywords=list(data.get("ats_keywords") or []),
+                    resume_bullet_suggestions=list(data.get("resume_bullet_suggestions") or []),
+                    cover_letter_draft=data.get("cover_letter_draft"),
+                    outreach_message_draft=data.get("outreach_message_draft") or "",
+                )
+            )
+        if generated_count:
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    if not packets:
+        raise HTTPException(status_code=404, detail="No matching jobs found")
+
+    combined_packet_text = "\n\n" + ("\n\n" + ("=" * 72) + "\n\n").join(packet.packet_text for packet in packets)
+    combined_packet_text = combined_packet_text.strip()
+    return BatchMaterialResponse(
+        generated_count=generated_count,
+        packets=packets,
+        combined_packet_text=combined_packet_text,
+    )
+
+
 @router.get("/{job_id}", response_model=JobRead)
 def get_job(job_id: int, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
@@ -1699,41 +1873,7 @@ async def materials(job_id: int, req: MaterialRequest, db: Session = Depends(get
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
-    stored = db.query(JobMaterial).filter(JobMaterial.job_id == job_id).first()
-    if stored:
-        return MaterialResponse(
-            ats_keywords=json.loads(stored.ats_keywords),
-            resume_bullet_suggestions=json.loads(stored.resume_bullet_suggestions),
-            cover_letter_draft=stored.cover_letter_draft,
-            outreach_message_draft=stored.outreach_message_draft,
-        )
-
-    # Privacy guard: hobbies are private recommendation signals and must not appear
-    # in employer-facing application materials.
-    profile = _load_profile_record(db)
-    blocked_hobbies = {_normalize_phrase(x) for x in _load_profile_hobbies(db, profile)}
-
-    def _remove_hobby_terms(values: list[str]) -> list[str]:
-        cleaned: list[str] = []
-        for raw in values:
-            term = _normalize_phrase(raw)
-            if term and term in blocked_hobbies:
-                continue
-            cleaned.append(raw)
-        return cleaned
-
-    safe_profile_skills = _remove_hobby_terms(req.profile_skills)
-    safe_experience_areas = _remove_hobby_terms(req.experience_areas)
-
-    data = await generate_materials(
-        title=job.title,
-        company=job.company,
-        description=job.description,
-        profile_skills=safe_profile_skills,
-        experience_areas=safe_experience_areas,
-        include_cover_letter=req.include_cover_letter,
-    )
+    data, _ = await _load_or_generate_material_payload(job, req, db, commit=True)
     return MaterialResponse(
         ats_keywords=data["ats_keywords"],
         resume_bullet_suggestions=data["resume_bullet_suggestions"],

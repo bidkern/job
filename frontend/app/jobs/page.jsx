@@ -376,6 +376,7 @@ export default function JobsPage() {
   const [errorNationwide, setErrorNationwide] = useState("");
   const [notice, setNotice] = useState("");
   const [queueingRefresh, setQueueingRefresh] = useState(false);
+  const [packetPanelLoading, setPacketPanelLoading] = useState("");
 
   const [sprintQueueIds, setSprintQueueIds] = useState([]);
   const [sprintIndex, setSprintIndex] = useState(0);
@@ -723,6 +724,14 @@ export default function JobsPage() {
     window.open(job.url, "_blank", "noopener,noreferrer");
   }
 
+  function selectedIdsForPanel(panel, { fallbackToVisible = false } = {}) {
+    const sourceJobs = panel === "local" ? localViewJobs : nationwideViewJobs;
+    const selected = panel === "local" ? selectedLocal : selectedNationwide;
+    if (selected.size > 0) return Array.from(selected);
+    if (!fallbackToVisible) return [];
+    return sourceJobs.map((job) => job.id);
+  }
+
   async function ensureSprintPacket(job) {
     if (!job) return "";
     if (sprintPacketById[job.id]) return sprintPacketById[job.id];
@@ -752,6 +761,49 @@ export default function JobsPage() {
     if (!text) return;
     const ok = await copyToClipboard(text);
     setNotice(ok ? "Apply packet copied to clipboard." : "Could not copy packet to clipboard.");
+  }
+
+  async function preparePacketBundle(panel, { copyAfterBuild = false } = {}) {
+    const ids = selectedIdsForPanel(panel);
+    if (ids.length === 0) {
+      if (panel === "local") setErrorLocal("Select at least one job to prepare packets.");
+      else setErrorNationwide("Select at least one job to prepare packets.");
+      return;
+    }
+
+    setPacketPanelLoading(panel);
+    if (panel === "local") setErrorLocal("");
+    else setErrorNationwide("");
+
+    try {
+      const response = await api.generateMaterialsBatch({
+        ids,
+        profile_skills: profileSkills,
+        experience_areas: profileSkills.slice(0, 10),
+        include_cover_letter: true,
+      });
+      const nextPackets = {};
+      for (const packet of response?.packets || []) {
+        if (packet?.job_id && packet?.packet_text) nextPackets[packet.job_id] = packet.packet_text;
+      }
+      setSprintPacketById((prev) => ({ ...prev, ...nextPackets }));
+
+      if (copyAfterBuild) {
+        const ok = await copyToClipboard(response?.combined_packet_text || "");
+        setNotice(
+          ok
+            ? `Copied ${response?.packets?.length || 0} application packet(s).`
+            : `Prepared ${response?.packets?.length || 0} packet(s), but clipboard copy failed.`
+        );
+      } else {
+        setNotice(`Prepared ${response?.packets?.length || 0} application packet(s).`);
+      }
+    } catch (e) {
+      if (panel === "local") setErrorLocal(e.message || "Could not prepare packets.");
+      else setErrorNationwide(e.message || "Could not prepare packets.");
+    } finally {
+      setPacketPanelLoading("");
+    }
   }
 
   function buildSprintQueue() {
@@ -800,8 +852,7 @@ export default function JobsPage() {
 
   async function quickApplyPanel(panel) {
     const sourceJobs = panel === "local" ? localViewJobs : nationwideViewJobs;
-    const selected = panel === "local" ? selectedLocal : selectedNationwide;
-    const ids = selected.size > 0 ? Array.from(selected) : sourceJobs.map((j) => j.id);
+    const ids = selectedIdsForPanel(panel, { fallbackToVisible: true });
     if (ids.length === 0) return;
 
     const idSet = new Set(ids);
@@ -921,6 +972,22 @@ export default function JobsPage() {
             </Button>
             <Button size="sm" variant="outline" onClick={() => setSelected(new Set())}>
               Clear
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => preparePacketBundle(panelKey)}
+              disabled={packetPanelLoading === panelKey}
+            >
+              {packetPanelLoading === panelKey ? "Preparing..." : "Build Packets"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => preparePacketBundle(panelKey, { copyAfterBuild: true })}
+              disabled={packetPanelLoading === panelKey}
+            >
+              {packetPanelLoading === panelKey ? "Preparing..." : "Copy Packets"}
             </Button>
             <Button size="sm" variant="secondary" onClick={() => quickApplyPanel(panelKey)}>
               1-Click Quick Apply
@@ -1101,12 +1168,12 @@ export default function JobsPage() {
           </span>
           {localRefreshState ? (
             <Badge variant={refreshBadgeVariant(localRefreshState)}>
-              Local: {refreshBadgeLabel(localRefreshState)} · {refreshCountLabel(localRefreshState)}
+              Local: {refreshBadgeLabel(localRefreshState)} | {refreshCountLabel(localRefreshState)}
             </Badge>
           ) : null}
           {nationwideRefreshState ? (
             <Badge variant={refreshBadgeVariant(nationwideRefreshState)}>
-              Nationwide: {refreshBadgeLabel(nationwideRefreshState)} · {refreshCountLabel(nationwideRefreshState)}
+              Nationwide: {refreshBadgeLabel(nationwideRefreshState)} | {refreshCountLabel(nationwideRefreshState)}
             </Badge>
           ) : null}
         </div>

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.job import Job
 from app.models.profile import UserProfile
-from app.services.dedupe import is_fuzzy_duplicate
+from app.services.dedupe import extract_external_job_keys, is_probable_duplicate
 from app.services.distance import distance_from_base_zip, infer_zip_from_location
 from app.services.extraction import extract_keywords, extract_skills
 from app.services.scoring import normalize_score_tuning_mode, score_job
@@ -83,23 +83,55 @@ def create_or_update_job_with_flag(
     base_zip = (((profile.zip_code or "").strip() if profile else "") or settings.base_zip)
     canonical_url = payload.get("canonical_url")
     existing: Job | None = None
+    incoming_source = str(payload.get("source") or "manual").strip().lower()
+    incoming_url = canonical_url or payload.get("url")
+    incoming_external_keys = extract_external_job_keys(
+        incoming_url,
+        source=incoming_source,
+        description=payload.get("description"),
+    )
 
     if canonical_url:
         existing = db.scalar(select(Job).where(Job.canonical_url == canonical_url))
 
     if not existing:
-        candidates = db.scalars(select(Job).where(Job.company == payload.get("company"))).all()
+        candidates = db.scalars(select(Job).order_by(Job.updated_at.desc()).limit(500)).all()
         for job in candidates:
-            if is_fuzzy_duplicate(
-                job.company,
-                job.title,
-                job.location_text,
-                payload.get("company"),
-                payload.get("title"),
-                payload.get("location_text"),
-            ):
+            existing_external_keys = extract_external_job_keys(
+                job.canonical_url or job.url,
+                source=job.source,
+                description=job.description,
+            )
+            if incoming_external_keys and existing_external_keys.intersection(incoming_external_keys):
                 existing = job
                 break
+        if not existing:
+            for job in candidates:
+                if is_probable_duplicate(
+                    existing_company=job.company,
+                    existing_title=job.title,
+                    existing_location=job.location_text,
+                    existing_url=job.canonical_url or job.url,
+                    existing_source=job.source,
+                    existing_description=job.description,
+                    existing_pay_min=job.pay_min,
+                    existing_pay_max=job.pay_max,
+                    company=payload.get("company"),
+                    title=payload.get("title"),
+                    location=payload.get("location_text"),
+                    url=incoming_url,
+                    source=incoming_source,
+                    description=payload.get("description"),
+                    pay_min=payload.get("pay_min"),
+                    pay_max=payload.get("pay_max"),
+                ):
+                    existing = job
+                    break
+
+    if existing and not existing.canonical_url and canonical_url:
+        existing.canonical_url = canonical_url
+    if existing and not existing.url and payload.get("url"):
+        existing.url = payload.get("url")
 
     extracted_skills = extract_skills(payload.get("description"))
     keywords = extract_keywords(payload.get("description"))
@@ -131,6 +163,9 @@ def create_or_update_job_with_flag(
 
     if existing:
         for key, value in payload.items():
+            current_value = getattr(existing, key, None)
+            if value in (None, "") and current_value not in (None, ""):
+                continue
             setattr(existing, key, value)
         existing.extracted_skills = json.dumps(extracted_skills)
         existing.keywords = json.dumps(keywords)

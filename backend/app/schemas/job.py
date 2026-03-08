@@ -102,6 +102,28 @@ class MaterialResponse(BaseModel):
     outreach_message_draft: str
 
 
+class BatchMaterialRequest(MaterialRequest):
+    ids: list[int] = Field(default_factory=list)
+
+
+class BatchMaterialPacket(BaseModel):
+    job_id: int
+    title: str
+    company: str | None = None
+    url: str | None = None
+    packet_text: str
+    ats_keywords: list[str] = Field(default_factory=list)
+    resume_bullet_suggestions: list[str] = Field(default_factory=list)
+    cover_letter_draft: str | None = None
+    outreach_message_draft: str
+
+
+class BatchMaterialResponse(BaseModel):
+    generated_count: int = 0
+    packets: list[BatchMaterialPacket] = Field(default_factory=list)
+    combined_packet_text: str = ""
+
+
 class IngestRequest(BaseModel):
     source: str
     payload: dict[str, Any]

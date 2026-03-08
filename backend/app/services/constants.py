@@ -492,6 +492,29 @@ AGGRESSIVE_MUSE_CATEGORIES = [
     "Food and Hospitality",
 ]
 
+AGGRESSIVE_LOCAL_SEARCH_TERMS = [
+    "associate",
+    "specialist",
+    "coordinator",
+    "representative",
+    "technician",
+    "warehouse",
+    "customer service",
+    "operations",
+    "sales",
+]
+
+AGGRESSIVE_NATIONAL_SEARCH_TERMS = [
+    "analyst",
+    "associate",
+    "specialist",
+    "coordinator",
+    "representative",
+    "operations",
+    "sales",
+    "customer service",
+]
+
 # Contiguous U.S. states (lower 48) for nationwide recommendation scans.
 CONTIGUOUS_US_STATES = [
     "Alabama",

@@ -61,6 +61,7 @@ export const api = {
   deleteJob: (id) => request(`/jobs/${id}`, { method: "DELETE" }),
   bulkAction: (ids, action) => request(`/jobs/bulk-action`, { method: "POST", body: JSON.stringify({ ids, action }) }),
   generateMaterials: (id, body) => request(`/jobs/${id}/materials`, { method: "POST", body: JSON.stringify(body) }),
+  generateMaterialsBatch: (body) => request("/jobs/materials/batch", { method: "POST", body: JSON.stringify(body), timeoutMs: 45000 }),
   getMetrics: () => request("/jobs/dashboard/metrics"),
   getRefreshStatus: () => request("/jobs/refresh-status"),
   queueRefreshSources: (body) =>
