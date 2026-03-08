@@ -1,0 +1,31 @@
+﻿{
+  "name": "Your Name",
+  "base_zip": "44224",
+  "radius_miles": 35,
+  "work_type_preference": ["onsite", "hybrid", "remote"],
+  "skills": [
+    "sql",
+    "python",
+    "tableau",
+    "power bi",
+    "requirements gathering",
+    "stakeholder management",
+    "zapier",
+    "n8n",
+    "prompt engineering"
+  ],
+  "experience_areas": [
+    "Reporting and dashboard development",
+    "Business process analysis",
+    "Retail presentation optimization",
+    "Workflow automation"
+  ],
+  "score_weights": {
+    "role": 0.34,
+    "skills": 0.26,
+    "distance": 0.16,
+    "salary": 0.14,
+    "freshness": 0.06,
+    "source": 0.04
+  }
+}

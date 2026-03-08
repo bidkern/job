@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: 210 33% 98%;
+  --foreground: 216 34% 17%;
+  --card: 0 0% 100%;
+  --card-foreground: 216 34% 17%;
+  --primary: 210 79% 46%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 32% 94%;
+  --secondary-foreground: 216 34% 17%;
+  --muted: 210 32% 94%;
+  --muted-foreground: 215 16% 47%;
+  --border: 216 20% 88%;
+  --input: 216 20% 88%;
+  --ring: 210 79% 46%;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 222 35% 10%;
+  --foreground: 210 20% 92%;
+  --card: 222 28% 13%;
+  --card-foreground: 210 20% 92%;
+  --primary: 210 85% 60%;
+  --primary-foreground: 220 30% 8%;
+  --secondary: 220 20% 18%;
+  --secondary-foreground: 210 20% 92%;
+  --muted: 220 18% 17%;
+  --muted-foreground: 215 14% 68%;
+  --border: 220 15% 25%;
+  --input: 220 15% 25%;
+  --ring: 210 85% 60%;
+}
+
+body {
+  background-image: radial-gradient(circle at top right, rgba(13, 110, 253, 0.1), transparent 40%);
+}
+
+.dark body {
+  background-image: radial-gradient(circle at top right, rgba(83, 153, 255, 0.14), transparent 40%);
+}
+
+pre {
+  overflow-x: auto;
+}

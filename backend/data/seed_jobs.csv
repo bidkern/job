@@ -1,0 +1,4 @@
+﻿title,company,location_text,city,state,remote_type,pay_min,pay_max,pay_text,job_type,seniority,posted_date,source,url,description
+Data Analyst,Acme Retail,"Akron, OH 44308",Akron,OH,hybrid,70000,90000,"$70k-$90k",FT,mid,2026-03-01,csv,https://example.com/jobs/1,"Build dashboards in Power BI and SQL; partner with stakeholders to deliver insights."
+Visual Merchandiser,Style House,"Cleveland, OH 44114",Cleveland,OH,onsite,45000,55000,"$45k-$55k",FT,entry,2026-02-28,csv,https://example.com/jobs/2,"Design in-store displays, execute planograms, and support seasonal retail presentation."
+AI Workflow Developer,Workflow Lab,Remote,,OH,remote,85000,110000,"$85k-$110k",Contract,mid,2026-03-02,csv,https://example.com/jobs/3,"Build n8n and Zapier automations, LLM workflows, and lightweight agent-based ops tools."

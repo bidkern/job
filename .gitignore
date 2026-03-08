@@ -1,0 +1,28 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+backend/uploads/
+
+# Node
+node_modules/
+dist/
+.next/
+frontend/.next/
+out/
+.turbo/
+frontend/.dev_pid.txt
+
+# Env / local db
+.env
+.env.local
+backend/.env
+frontend/.env.local
+backend/jobs.db
+jobs.db
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
