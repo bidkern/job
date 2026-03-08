@@ -117,6 +117,7 @@ class JobSearchRequest(BaseModel):
     created_after: datetime | None = None
     pages: int = 6
     limit: int = 500
+    refresh_pool: bool = True
 
 
 class NationwideRecommendationRequest(BaseModel):
@@ -170,3 +171,22 @@ class RescoreAllResponse(BaseModel):
     score_tuning_mode: str = "balanced"
     base_zip: str | None = None
     last_rescored_at: datetime
+
+
+class RefreshScopeRead(BaseModel):
+    scope: str
+    label: str
+    status: str
+    active: bool = False
+    last_enqueued_at: datetime | None = None
+    last_started_at: datetime | None = None
+    last_finished_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error: str | None = None
+    items_written: int = 0
+    updated_at: datetime | None = None
+
+
+class RefreshStatusResponse(BaseModel):
+    last_source_refresh_at: datetime | None = None
+    scopes: list[RefreshScopeRead] = Field(default_factory=list)

@@ -6,6 +6,7 @@ import { Clipboard, ExternalLink, Search, SkipForward, WandSparkles } from "luci
 
 import { ScoreWhyPopover } from "@/components/score-why-popover";
 import { StatusBadge } from "@/components/status-badge";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -61,6 +62,28 @@ function parseBoundedScore(value, fallback = 8) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(10, n));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function refreshBadgeVariant(scopeState) {
+  const status = String(scopeState?.status || "idle").toLowerCase();
+  if (status === "running") return "info";
+  if (status === "queued") return "warning";
+  if (status === "error") return "danger";
+  if (status === "success") return "success";
+  return "default";
+}
+
+function refreshBadgeLabel(scopeState) {
+  const status = String(scopeState?.status || "idle").toLowerCase();
+  if (status === "running") return "Refreshing";
+  if (status === "queued") return "Queued";
+  if (status === "error") return "Needs retry";
+  if (status === "success") return "Up to date";
+  return "Idle";
 }
 
 function formatDateTime(value) {
@@ -307,6 +330,7 @@ export default function JobsPage() {
   const [profileSkills, setProfileSkills] = useState([]);
   const [scoreMode, setScoreMode] = useState("balanced");
   const [lastRescoredAt, setLastRescoredAt] = useState("");
+  const [refreshStatus, setRefreshStatus] = useState({ last_source_refresh_at: null, scopes: [] });
 
   const [localSort, setLocalSort] = useState("expected_value");
   const [nationwideSort, setNationwideSort] = useState("expected_value");
@@ -334,6 +358,15 @@ export default function JobsPage() {
     () => sortJobs(nationwideJobs, nationwideSort, "nationwide"),
     [nationwideJobs, nationwideSort]
   );
+  const refreshScopeMap = useMemo(() => {
+    const map = new Map();
+    for (const item of refreshStatus?.scopes || []) {
+      map.set(item.scope, item);
+    }
+    return map;
+  }, [refreshStatus]);
+  const localRefreshState = refreshScopeMap.get("local_search") || null;
+  const nationwideRefreshState = refreshScopeMap.get("nationwide") || null;
 
   const localCount = localViewJobs.length;
   const nationwideCount = nationwideViewJobs.length;
@@ -375,7 +408,16 @@ export default function JobsPage() {
 
   const currentSprintPacket = currentSprintJob ? sprintPacketById[currentSprintJob.id] || "" : "";
 
-  const refreshLocal = async ({ quick = false, background = false } = {}) => {
+  const loadRefreshStatus = async () => {
+    try {
+      const status = await api.getRefreshStatus();
+      setRefreshStatus(status || { last_source_refresh_at: null, scopes: [] });
+    } catch {
+      // Keep UI usable if refresh-state polling fails.
+    }
+  };
+
+  const refreshLocal = async ({ quick = false, background = false, refreshPool = true } = {}) => {
     if (!background) {
       setLoadingLocal(true);
       setErrorLocal("");
@@ -406,6 +448,7 @@ export default function JobsPage() {
             exclude_confidential: recommendationParams.exclude_confidential,
             pages: LOCAL_QUICK_PAGES,
             limit: LOCAL_QUICK_LIMIT,
+            refresh_pool: false,
           });
           if (!background) {
             setNotice("Saved local matches were slow. Showing a fresh local search instead.");
@@ -422,6 +465,7 @@ export default function JobsPage() {
           exclude_confidential: true,
           pages: quick ? LOCAL_QUICK_PAGES : LOCAL_PAGES,
           limit: quick ? LOCAL_QUICK_LIMIT : LOCAL_LIMIT,
+          refresh_pool: refreshPool,
         });
       }
       if ((rows || []).length > 0 || !background) {
@@ -506,6 +550,7 @@ export default function JobsPage() {
   const searchJobs = async () => {
     setNotice("Searching local jobs first...");
     await refreshLocal({ quick: true, background: false });
+    void loadRefreshStatus();
     setNotice("Local jobs loaded. Searching nationwide recommendations...");
 
     void (async () => {
@@ -513,9 +558,14 @@ export default function JobsPage() {
     })();
 
     void (async () => {
-      await refreshLocal({ quick: false, background: true });
+      setNotice("Showing saved matches now. Refreshing job sources in the background...");
+      await refreshLocal({ quick: false, background: true, refreshPool: true });
       await refreshNationwide({ refreshPool: true, background: true });
-      setNotice("Search updated with broader results.");
+      await wait(4500);
+      await refreshLocal({ quick: false, background: true, refreshPool: false });
+      await refreshNationwide({ refreshPool: false, background: true });
+      await loadRefreshStatus();
+      setNotice("Search updated with newly refreshed listings.");
     })();
   };
 
@@ -551,15 +601,25 @@ export default function JobsPage() {
         setProfileSkills(Array.isArray(p?.skills) ? p.skills : []);
         if (p?.score_tuning_mode) setScoreMode(String(p.score_tuning_mode).toLowerCase());
         if (p?.last_rescored_at) setLastRescoredAt(p.last_rescored_at);
+        void loadRefreshStatus();
         setTimeout(() => {
           loadInitialJobs();
         }, 0);
       })
       .catch(() => {
+        void loadRefreshStatus();
         setTimeout(() => {
           loadInitialJobs();
         }, 0);
       });
+  }, []);
+
+  useEffect(() => {
+    void loadRefreshStatus();
+    const timer = setInterval(() => {
+      void loadRefreshStatus();
+    }, 12000);
+    return () => clearInterval(timer);
   }, []);
 
   const allLocalSelected = useMemo(
@@ -739,6 +799,7 @@ export default function JobsPage() {
   function JobListPanel({
     title,
     subtitle,
+    refreshState,
     jobs,
     selected,
     setSelected,
@@ -753,8 +814,17 @@ export default function JobsPage() {
     return (
       <Card className="h-full">
         <CardHeader className="pb-3">
-          <CardTitle>{title}</CardTitle>
-          <CardDescription>{subtitle}</CardDescription>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <CardTitle>{title}</CardTitle>
+              <CardDescription>{subtitle}</CardDescription>
+            </div>
+            {refreshState ? (
+              <Badge variant={refreshBadgeVariant(refreshState)}>
+                {refreshState.label}: {refreshBadgeLabel(refreshState)}
+              </Badge>
+            ) : null}
+          </div>
         </CardHeader>
         <CardContent>
           <div className="mb-3 flex flex-wrap items-center gap-2 border-b pb-3">
@@ -946,6 +1016,19 @@ export default function JobsPage() {
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="rounded-full border px-2 py-0.5">Score mode: {scoreMode}</span>
           <span className="rounded-full border px-2 py-0.5">Last rescored: {formatDateTime(lastRescoredAt)}</span>
+          <span className="rounded-full border px-2 py-0.5">
+            Last source refresh: {formatDateTime(refreshStatus?.last_source_refresh_at)}
+          </span>
+          {localRefreshState ? (
+            <Badge variant={refreshBadgeVariant(localRefreshState)}>
+              Local: {refreshBadgeLabel(localRefreshState)}
+            </Badge>
+          ) : null}
+          {nationwideRefreshState ? (
+            <Badge variant={refreshBadgeVariant(nationwideRefreshState)}>
+              Nationwide: {refreshBadgeLabel(nationwideRefreshState)}
+            </Badge>
+          ) : null}
         </div>
       </div>
 
@@ -1008,8 +1091,22 @@ export default function JobsPage() {
               <Search className="h-4 w-4" />
               Search Jobs
             </Button>
-            <Button variant="outline" onClick={() => refreshLocal({ quick: true })}>Search Local</Button>
-            <Button variant="outline" onClick={() => refreshNationwide({ refreshPool: true })}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                void refreshLocal({ quick: true });
+                void loadRefreshStatus();
+              }}
+            >
+              Search Local
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                void refreshNationwide({ refreshPool: true });
+                void loadRefreshStatus();
+              }}
+            >
               Search Nationwide
             </Button>
             <Button variant="outline" onClick={() => refreshNationwide({ refreshPool: false })}>
@@ -1182,6 +1279,7 @@ export default function JobsPage() {
         <JobListPanel
           title={`Local Matches (${localCount})`}
           subtitle="Jobs near your ZIP and radius, matching your search settings."
+          refreshState={localRefreshState}
           jobs={localViewJobs}
           selected={selectedLocal}
           setSelected={setSelectedLocal}
@@ -1197,6 +1295,7 @@ export default function JobsPage() {
         <JobListPanel
           title={`Top Nationwide Recommended (${nationwideCount})`}
           subtitle="Highest-fit recommendations across the U.S. with your score thresholds."
+          refreshState={nationwideRefreshState}
           jobs={nationwideViewJobs}
           selected={selectedNationwide}
           setSelected={setSelectedNationwide}

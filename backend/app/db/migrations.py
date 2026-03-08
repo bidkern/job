@@ -62,6 +62,25 @@ def run_migrations(engine: Engine) -> None:
         conn.execute(
             text(
                 """
+                CREATE TABLE IF NOT EXISTS refresh_states (
+                    id INTEGER PRIMARY KEY,
+                    scope VARCHAR(40) NOT NULL UNIQUE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'idle',
+                    last_enqueued_at DATETIME,
+                    last_started_at DATETIME,
+                    last_finished_at DATETIME,
+                    last_success_at DATETIME,
+                    last_error TEXT,
+                    items_written INTEGER NOT NULL DEFAULT 0,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
                 CREATE TABLE IF NOT EXISTS user_profiles (
                     id INTEGER PRIMARY KEY,
                     full_name VARCHAR(120),
@@ -104,3 +123,88 @@ def run_migrations(engine: Engine) -> None:
                 conn.execute(text("ALTER TABLE jobs ADD COLUMN attachments TEXT"))
             if "raw_description" not in jobs_columns:
                 conn.execute(text("ALTER TABLE jobs ADD COLUMN raw_description TEXT"))
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_remote_type ON jobs(remote_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_status_updated_at ON jobs(status, updated_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_posted_date ON jobs(posted_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_follow_up_date ON jobs(follow_up_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_salary_bounds ON jobs(pay_max, pay_min)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_refresh_states_scope ON refresh_states(scope)"))
+
+        conn.execute(
+            text(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+                    title,
+                    company,
+                    location_text,
+                    description,
+                    content='jobs',
+                    content_rowid='id'
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS jobs_fts_ai AFTER INSERT ON jobs BEGIN
+                    INSERT INTO jobs_fts(rowid, title, company, location_text, description)
+                    VALUES (
+                        new.id,
+                        coalesce(new.title, ''),
+                        coalesce(new.company, ''),
+                        coalesce(new.location_text, ''),
+                        coalesce(new.description, '')
+                    );
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS jobs_fts_ad AFTER DELETE ON jobs BEGIN
+                    INSERT INTO jobs_fts(jobs_fts, rowid, title, company, location_text, description)
+                    VALUES (
+                        'delete',
+                        old.id,
+                        coalesce(old.title, ''),
+                        coalesce(old.company, ''),
+                        coalesce(old.location_text, ''),
+                        coalesce(old.description, '')
+                    );
+                END
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS jobs_fts_au AFTER UPDATE ON jobs BEGIN
+                    INSERT INTO jobs_fts(jobs_fts, rowid, title, company, location_text, description)
+                    VALUES (
+                        'delete',
+                        old.id,
+                        coalesce(old.title, ''),
+                        coalesce(old.company, ''),
+                        coalesce(old.location_text, ''),
+                        coalesce(old.description, '')
+                    );
+                    INSERT INTO jobs_fts(rowid, title, company, location_text, description)
+                    VALUES (
+                        new.id,
+                        coalesce(new.title, ''),
+                        coalesce(new.company, ''),
+                        coalesce(new.location_text, ''),
+                        coalesce(new.description, '')
+                    );
+                END
+                """
+            )
+        )
+        conn.execute(text("INSERT INTO jobs_fts(jobs_fts) VALUES ('rebuild')"))

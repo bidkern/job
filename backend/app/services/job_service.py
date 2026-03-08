@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -163,7 +163,99 @@ def create_or_update_job_with_flag(
     return new_job, True
 
 
+def _jobs_fts_available(db: Session) -> bool:
+    row = db.execute(
+        text("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = 'jobs_fts' LIMIT 1")
+    ).first()
+    return row is not None
+
+
+def _build_fts_match_query(raw_query: str) -> str | None:
+    normalized = " ".join(str(raw_query or "").strip().split())
+    if not normalized:
+        return None
+
+    tokens = []
+    for token in normalized.lower().split():
+        cleaned = "".join(ch for ch in token if ch.isalnum() or ch in {"+", "#"})
+        if len(cleaned) >= 2:
+            tokens.append(cleaned)
+
+    if not tokens:
+        return None
+
+    parts: list[str] = []
+    if len(normalized.split()) > 1:
+        escaped_phrase = normalized.replace('"', '""')
+        parts.append(f'"{escaped_phrase}"')
+    for token in tokens[:8]:
+        parts.append(f"{token}*")
+    if not parts:
+        return None
+    return " OR ".join(dict.fromkeys(parts))
+
+
+def _list_jobs_fts(db: Session, filters: dict) -> list[Job]:
+    match_query = _build_fts_match_query(str(filters.get("q") or ""))
+    if not match_query or not _jobs_fts_available(db):
+        return []
+
+    limit = filters.get("limit")
+    try:
+        search_limit = max(50, min(500, int(limit) * 4 if limit is not None else 200))
+    except (TypeError, ValueError):
+        search_limit = 200
+
+    try:
+        ids = list(
+            db.execute(
+                text(
+                    """
+                    SELECT rowid
+                    FROM jobs_fts
+                    WHERE jobs_fts MATCH :match_query
+                    ORDER BY bm25(jobs_fts, 8.0, 5.0, 2.0, 1.0)
+                    LIMIT :search_limit
+                    """
+                ),
+                {"match_query": match_query, "search_limit": search_limit},
+            ).scalars()
+        )
+    except Exception:
+        return []
+
+    if not ids:
+        return []
+
+    jobs = db.scalars(select(Job).where(Job.id.in_(ids))).all()
+    jobs_by_id = {job.id: job for job in jobs}
+    ordered = [jobs_by_id[job_id] for job_id in ids if job_id in jobs_by_id]
+
+    if filters.get("status"):
+        ordered = [job for job in ordered if job.status == filters["status"]]
+    if filters.get("remote_type"):
+        ordered = [job for job in ordered if job.remote_type == filters["remote_type"]]
+    if filters.get("source"):
+        ordered = [job for job in ordered if job.source == filters["source"]]
+    if filters.get("max_distance") is not None:
+        ordered = [job for job in ordered if job.distance_miles is None or job.distance_miles <= filters["max_distance"]]
+    if filters.get("salary_present"):
+        ordered = [job for job in ordered if job.pay_min is not None or job.pay_max is not None or bool(job.pay_text)]
+
+    if limit is not None:
+        try:
+            ordered = ordered[: max(1, int(limit))]
+        except (TypeError, ValueError):
+            pass
+    return ordered
+
+
 def list_jobs(db: Session, filters: dict) -> list[Job]:
+    if filters.get("q"):
+        fts_rows = _list_jobs_fts(db, filters)
+        if fts_rows:
+            return fts_rows
+
     query = select(Job)
     if filters.get("q"):
         q = f"%{str(filters['q']).strip().lower()}%"

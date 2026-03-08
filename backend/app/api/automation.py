@@ -14,6 +14,7 @@ from app.schemas.automation import (
     JobSourceUpdate,
 )
 from app.services.automation import get_latest_automation_run, run_automation_cycle
+from app.services.query_cache import invalidate_jobs_query_cache
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
@@ -61,6 +62,7 @@ def update_source(source_id: int, payload: JobSourceUpdate, db: Session = Depend
 @router.post("/run-now", response_model=AutomationRunResponse)
 async def run_now(db: Session = Depends(get_db)):
     run = await run_automation_cycle(db)
+    invalidate_jobs_query_cache()
     return AutomationRunResponse(
         run_started_at=run.run_started_at,
         run_finished_at=run.run_finished_at,

@@ -62,6 +62,7 @@ export const api = {
   bulkAction: (ids, action) => request(`/jobs/bulk-action`, { method: "POST", body: JSON.stringify({ ids, action }) }),
   generateMaterials: (id, body) => request(`/jobs/${id}/materials`, { method: "POST", body: JSON.stringify(body) }),
   getMetrics: () => request("/jobs/dashboard/metrics"),
+  getRefreshStatus: () => request("/jobs/refresh-status"),
   ingest: (body) => request("/jobs/ingest", { method: "POST", body: JSON.stringify(body) }),
   searchJobs: (body) => request("/jobs/search", { method: "POST", body: JSON.stringify(body), timeoutMs: 30000 }),
   discoverCompanySites: (body) => request("/jobs/discover-company-sites", { method: "POST", body: JSON.stringify(body) }),

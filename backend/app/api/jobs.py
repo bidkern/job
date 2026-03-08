@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models.job import Job
 from app.models.job_material import JobMaterial
 from app.models.profile import UserProfile
@@ -27,6 +27,8 @@ from app.schemas.job import (
     MaterialRequest,
     MaterialResponse,
     NationwideRecommendationRequest,
+    RefreshScopeRead,
+    RefreshStatusResponse,
     RescoreAllResponse,
 )
 from app.services import ingestion
@@ -34,6 +36,16 @@ from app.services.job_service import create_or_update_job, get_dashboard_metrics
 from app.services.distance import ZIP_CITY_STATE, distance_from_base_zip, infer_zip_from_location
 from app.services.extraction import extract_skills
 from app.services.materials import generate_materials
+from app.services.background_refresh import enqueue_refresh
+from app.services.query_cache import invalidate_jobs_query_cache, jobs_query_cache
+from app.services.refresh_state import (
+    ACTIVE_REFRESH_STATUSES,
+    REFRESH_SCOPE_LABELS,
+    list_refresh_states,
+    mark_refresh_finished,
+    mark_refresh_queued,
+    mark_refresh_started,
+)
 from app.services.constants import (
     AGGRESSIVE_GREENHOUSE_TOKENS,
     AGGRESSIVE_LEVER_SLUGS,
@@ -377,6 +389,465 @@ def _build_national_locations(city: str | None, state_name: str | None, state_co
     return list(CONTIGUOUS_US_STATES), True
 
 
+def _refresh_queue_key(namespace: str, payload: dict[str, Any]) -> str:
+    return f"{namespace}:{json.dumps(payload, sort_keys=True, default=str)}"
+
+
+async def _refresh_search_pool_async(payload: dict[str, Any]) -> None:
+    req = JobSearchRequest.model_validate(payload)
+    db = SessionLocal()
+    scope = "local_search"
+    items_written = 0
+    mark_refresh_started(scope)
+    try:
+        query = (req.query or "").strip()
+        profile_skills = _load_profile_skills(db)
+        profile_hobbies = _load_profile_hobbies(db)
+        requested_zip = (req.base_zip or "").strip() or None
+        aggressive_mode = bool(settings.aggressive_legal_mode)
+        pages = min(max(req.pages, 1), 4 if aggressive_mode else 3)
+        if not query:
+            pages = min(pages, 2)
+        limit = max(1, min(req.limit, 160))
+        ingested: list[dict[str, Any]] = []
+        remote_pref = (req.remote_type or "any").lower().strip()
+        locations = _default_search_locations(requested_zip)
+        enabled_sources = db.scalars(select(JobSource).where(JobSource.enabled.is_(True))).all()
+
+        async def _safe_fetch(coro, timeout_seconds: float = 12.0) -> list[dict[str, Any]]:
+            try:
+                return await asyncio.wait_for(coro, timeout=timeout_seconds)
+            except Exception:
+                return []
+
+        pending_fetches: list[tuple[Any, float]] = []
+
+        def _queue(factory: Any, timeout_seconds: float) -> None:
+            pending_fetches.append((factory, timeout_seconds))
+
+        for src in enabled_sources:
+            try:
+                cfg = json.loads(src.config_json or "{}")
+            except json.JSONDecodeError:
+                cfg = {}
+            try:
+                st = (src.source_type or "").lower().strip()
+                if st == "greenhouse" and cfg.get("board_token"):
+                    token = cfg["board_token"]
+                    _queue(lambda token=token: ingestion.fetch_greenhouse(token), 8.0)
+                elif st == "lever" and cfg.get("company_slug"):
+                    slug = cfg["company_slug"]
+                    _queue(lambda slug=slug: ingestion.fetch_lever(slug), 8.0)
+                elif st == "rss" and cfg.get("rss_url"):
+                    rss_url = cfg["rss_url"]
+                    _queue(lambda rss_url=rss_url: ingestion.fetch_rss(rss_url), 8.0)
+                elif st == "adzuna":
+                    app_id = cfg.get("app_id") or settings.adzuna_app_id
+                    app_key = cfg.get("app_key") or settings.adzuna_app_key
+                    if app_id and app_key:
+                        for page in range(1, min(pages, 5 if aggressive_mode else 3) + 1):
+                            where = cfg.get("where", requested_zip or "Akron, OH")
+                            what = query or cfg.get("what", "jobs")
+                            _queue(
+                                lambda app_id=app_id, app_key=app_key, where=where, what=what, page=page: ingestion.fetch_adzuna(
+                                    app_id,
+                                    app_key,
+                                    where=where,
+                                    what=what,
+                                    page=page,
+                                ),
+                                8.0,
+                            )
+                elif st == "themuse":
+                    for page in range(1, min(pages, 8 if aggressive_mode else 5) + 1):
+                        location = cfg.get("location", requested_zip or "Ohio")
+                        category = cfg.get("category")
+                        _queue(
+                            lambda location=location, category=category, page=page: ingestion.fetch_themuse(
+                                location=location,
+                                category=category,
+                                page=page,
+                            ),
+                            8.0,
+                        )
+            except Exception:
+                continue
+
+        fallback_locations = locations if query else locations[:3]
+        for location in fallback_locations:
+            for page in range(1, min(pages, 10 if aggressive_mode else 5) + 1):
+                try:
+                    _queue(lambda location=location, page=page: ingestion.fetch_themuse(location=location, page=page), 6.0)
+                except Exception:
+                    continue
+
+        if aggressive_mode:
+            local_focus_locations = locations[:6] if query else locations[:3]
+            local_focus_locations = local_focus_locations if local_focus_locations else ["Akron, OH", "Cleveland, OH", "Ohio"]
+            for location in local_focus_locations:
+                for category in AGGRESSIVE_MUSE_CATEGORIES:
+                    for page in range(1, min(pages, 4 if query else 2) + 1):
+                        try:
+                            _queue(
+                                lambda location=location, category=category, page=page: ingestion.fetch_themuse(
+                                    location=location,
+                                    category=category,
+                                    page=page,
+                                ),
+                                7.0,
+                            )
+                        except Exception:
+                            continue
+
+            if query:
+                for token in AGGRESSIVE_GREENHOUSE_TOKENS:
+                    try:
+                        _queue(lambda token=token: ingestion.fetch_greenhouse(token), 6.0)
+                    except Exception:
+                        continue
+                for slug in AGGRESSIVE_LEVER_SLUGS:
+                    try:
+                        _queue(lambda slug=slug: ingestion.fetch_lever(slug), 6.0)
+                    except Exception:
+                        continue
+
+        if settings.adzuna_app_id and settings.adzuna_app_key:
+            where = requested_zip or "United States"
+            for page in range(1, min(4 if aggressive_mode else 2, pages) + 1):
+                try:
+                    what = query or "jobs"
+                    _queue(
+                        lambda where=where, what=what, page=page: ingestion.fetch_adzuna(
+                            settings.adzuna_app_id,
+                            settings.adzuna_app_key,
+                            where=where,
+                            what=what,
+                            page=page,
+                        ),
+                        7.0,
+                    )
+                except Exception:
+                    continue
+
+        max_tasks = 72 if (aggressive_mode and query) else (48 if query else 24)
+        if len(pending_fetches) > max_tasks:
+            pending_fetches = pending_fetches[:max_tasks]
+
+        if pending_fetches:
+            batch_size = 8 if aggressive_mode else 6
+            for i in range(0, len(pending_fetches), batch_size):
+                batch = pending_fetches[i : i + batch_size]
+                coros = [_safe_fetch(factory(), timeout_seconds=timeout_seconds) for factory, timeout_seconds in batch]
+                fetched = await asyncio.gather(*coros, return_exceptions=True)
+                for chunk in fetched:
+                    if isinstance(chunk, list):
+                        ingested.extend(chunk)
+
+        query_tokens = [t for t in query.lower().split() if t] if query else []
+        weak_tokens = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "with", "role", "job", "jobs", "line", "worker"}
+        significant_tokens = [t for t in query_tokens if len(t) >= 3 and t not in weak_tokens]
+        expanded_tokens = set(significant_tokens)
+        query_lower = query.lower()
+        query_aliases = {
+            "line cook": ["cook", "kitchen", "restaurant", "food", "catering", "chef", "prep"],
+            "fast food": ["food", "restaurant", "crew", "cook", "catering", "cashier"],
+            "factory worker": ["factory", "manufacturing", "production", "assembly", "warehouse", "laborer", "operator"],
+            "warehouse": ["warehouse", "distribution", "shipping", "receiving", "fulfillment", "forklift"],
+            "sales representative": ["sales", "representative", "account", "business development", "consultant"],
+        }
+        for phrase, aliases in query_aliases.items():
+            if phrase in query_lower:
+                expanded_tokens.update(aliases)
+
+        def _matches_query(item: dict[str, Any]) -> bool:
+            if not query_tokens:
+                return True
+            title_company = f"{item.get('title', '')} {item.get('company', '')}".lower()
+            haystack = f"{title_company} {item.get('description', '')}".lower()
+            if query.lower() in haystack:
+                return True
+
+            def _contains_word(text: str, token: str) -> bool:
+                return re.search(rf"\b{re.escape(token)}\b", text) is not None
+
+            if expanded_tokens:
+                title_hits = sum(1 for token in expanded_tokens if _contains_word(title_company, token))
+                if title_hits >= 1:
+                    return True
+                desc_hits = sum(1 for token in expanded_tokens if _contains_word(haystack, token))
+                if desc_hits >= 1:
+                    return True
+            token_hits = sum(1 for token in query_tokens if _contains_word(title_company, token))
+            return token_hits >= 1
+
+        candidates: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for item in ingested:
+            if not _matches_query(item):
+                continue
+            if not _raw_item_matches_profile(item, profile_skills, profile_hobbies):
+                continue
+            if req.salary_required and not _raw_item_has_salary(item):
+                continue
+            if req.exclude_confidential and _is_confidential_employer(item.get("company")):
+                continue
+            key = (item.get("canonical_url") or item.get("url") or "").strip()
+            if key:
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+            candidates.append(item)
+
+        if remote_pref == "local" and requested_zip:
+            def _local_priority(item: dict[str, Any]) -> tuple[int, float]:
+                remote_type = str(item.get("remote_type") or "unknown").lower().strip()
+                if remote_type == "remote":
+                    return (2, 9999.0)
+                target = infer_zip_from_location(
+                    item.get("location_text"),
+                    city=item.get("city"),
+                    state=item.get("state"),
+                )
+                dist = distance_from_base_zip(requested_zip, target)
+                if dist is not None:
+                    return (0, dist)
+                if _location_looks_local(requested_zip, item.get("location_text")):
+                    return (1, 0.0)
+                return (2, 9999.0)
+
+            candidates.sort(key=_local_priority)
+
+        max_persist = _bounded_candidate_limit(
+            limit,
+            multiplier=2,
+            minimum=60,
+            maximum=180 if aggressive_mode else 120,
+        )
+        touched: dict[int, Job] = {}
+        for item in candidates[:max_persist]:
+            saved = create_or_update_job(db, item, profile_skills, commit=False)
+            touched[saved.id] = saved
+        if touched:
+            db.commit()
+            invalidate_jobs_query_cache()
+            items_written = len(touched)
+        mark_refresh_finished(scope, success=True, items_written=items_written)
+    except Exception as exc:
+        db.rollback()
+        mark_refresh_finished(scope, success=False, items_written=items_written, error=f"Local refresh failed: {exc}")
+    finally:
+        db.close()
+
+
+async def _refresh_national_pool_async(payload: dict[str, Any]) -> None:
+    req = NationwideRecommendationRequest.model_validate(payload)
+    if not req.refresh_pool:
+        return
+
+    db = SessionLocal()
+    scope = "nationwide"
+    items_written = 0
+    mark_refresh_started(scope)
+    try:
+        query = (req.query or "").strip()
+        city = (req.city or "").strip() or None
+        zip_code = (req.zip_code or "").strip() or None
+        state_name, state_code = _normalize_state_value(req.state)
+        search_locations, nationwide_scope = _build_national_locations(city, state_name, state_code, zip_code)
+        profile = _load_profile_record(db)
+        profile_skills = _load_profile_skills(db, profile)
+        profile_hobbies = _load_profile_hobbies(db, profile)
+        ingested: list[dict[str, Any]] = []
+        touched: dict[int, Job] = {}
+
+        pending_fetches: list[tuple[Any, float]] = []
+
+        def _queue(factory: Any, timeout_seconds: float) -> None:
+            pending_fetches.append((factory, timeout_seconds))
+
+        pages_per_region = max(1, min(req.pages_per_region, 2))
+        muse_categories = AGGRESSIVE_MUSE_CATEGORIES[:4]
+
+        for location in search_locations:
+            for page in range(1, pages_per_region + 1):
+                _queue(lambda location=location, page=page: ingestion.fetch_themuse(location=location, page=page), 8.0)
+                if query and len(search_locations) <= 6:
+                    for category in muse_categories:
+                        _queue(
+                            lambda location=location, category=category, page=page: ingestion.fetch_themuse(
+                                location=location,
+                                category=category,
+                                page=page,
+                            ),
+                            8.0,
+                        )
+                elif nationwide_scope and page == 1:
+                    for category in muse_categories[:2]:
+                        _queue(
+                            lambda location=location, category=category: ingestion.fetch_themuse(
+                                location=location,
+                                category=category,
+                                page=1,
+                            ),
+                            8.0,
+                        )
+            if settings.adzuna_app_id and settings.adzuna_app_key:
+                max_adzuna_pages = 1 if nationwide_scope else min(2, pages_per_region)
+                for page in range(1, max_adzuna_pages + 1):
+                    what = query or "jobs"
+                    _queue(
+                        lambda location=location, what=what, page=page: ingestion.fetch_adzuna(
+                            settings.adzuna_app_id,
+                            settings.adzuna_app_key,
+                            where=location,
+                            what=what,
+                            page=page,
+                        ),
+                        9.0,
+                    )
+
+        for token in AGGRESSIVE_GREENHOUSE_TOKENS:
+            _queue(lambda token=token: ingestion.fetch_greenhouse(token), 8.0)
+        for slug in AGGRESSIVE_LEVER_SLUGS:
+            _queue(lambda slug=slug: ingestion.fetch_lever(slug), 8.0)
+
+        max_tasks = 60 if nationwide_scope else 40
+        if len(pending_fetches) > max_tasks:
+            pending_fetches = pending_fetches[:max_tasks]
+
+        async def _safe_fetch(coro, timeout_seconds: float) -> list[dict[str, Any]]:
+            try:
+                return await asyncio.wait_for(coro, timeout=timeout_seconds)
+            except Exception:
+                return []
+
+        batch_size = 8
+        for i in range(0, len(pending_fetches), batch_size):
+            batch = pending_fetches[i : i + batch_size]
+            coros = [_safe_fetch(factory(), timeout_seconds=timeout) for factory, timeout in batch]
+            fetched = await asyncio.gather(*coros, return_exceptions=True)
+            for chunk in fetched:
+                if isinstance(chunk, list):
+                    ingested.extend(chunk)
+
+        seen_keys: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        for item in ingested:
+            if not _raw_item_matches_query(item, query):
+                continue
+            if not _raw_item_matches_profile(item, profile_skills, profile_hobbies):
+                continue
+            if req.salary_required and not _raw_item_has_salary(item):
+                continue
+            if req.exclude_confidential and _is_confidential_employer(item.get("company")):
+                continue
+            dedupe_key = (item.get("canonical_url") or item.get("url") or "").strip().lower()
+            if dedupe_key and dedupe_key in seen_keys:
+                continue
+            if dedupe_key:
+                seen_keys.add(dedupe_key)
+            candidates.append(item)
+
+        max_persist = _bounded_candidate_limit(
+            req.limit,
+            multiplier=8 if nationwide_scope else 6,
+            minimum=80,
+            maximum=250 if nationwide_scope else 160,
+        )
+        for item in candidates[:max_persist]:
+            saved = create_or_update_job(db, item, profile_skills, commit=False)
+            touched[saved.id] = saved
+        if touched:
+            db.commit()
+            invalidate_jobs_query_cache()
+            items_written = len(touched)
+        mark_refresh_finished(scope, success=True, items_written=items_written)
+    except Exception as exc:
+        db.rollback()
+        mark_refresh_finished(scope, success=False, items_written=items_written, error=f"Nationwide refresh failed: {exc}")
+    finally:
+        db.close()
+
+
+async def warm_startup_caches() -> None:
+    db = SessionLocal()
+    try:
+        profile = _load_profile_record(db)
+        base_zip = _load_profile_zip(db, profile) or settings.base_zip or "44224"
+        distance_miles = float(profile.distance_miles) if profile and profile.distance_miles else 35.0
+
+        recommendations(
+            limit=25,
+            base_zip=base_zip,
+            max_distance=distance_miles,
+            min_salary=None,
+            remote_type="local",
+            salary_required=True,
+            exclude_confidential=True,
+            db=db,
+        )
+
+        await nationwide_recommendations(
+            NationwideRecommendationRequest(
+                base_zip=base_zip,
+                max_distance=distance_miles,
+                remote_type="any",
+                salary_required=True,
+                exclude_confidential=True,
+                min_interview_score_10=5.5,
+                min_compatibility_score_10=6.5,
+                limit=25,
+                pages_per_region=1,
+                refresh_pool=False,
+                adaptive_thresholds=True,
+            ),
+            db,
+        )
+
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def _serialize_refresh_state_rows(db: Session) -> RefreshStatusResponse:
+    states = list_refresh_states(db)
+    state_by_scope = {state.scope: state for state in states}
+    scopes: list[RefreshScopeRead] = []
+    last_source_refresh_at: datetime | None = None
+    for scope in REFRESH_SCOPE_LABELS:
+        state = state_by_scope.get(scope)
+        if state is None:
+            scopes.append(
+                RefreshScopeRead(
+                    scope=scope,
+                    label=REFRESH_SCOPE_LABELS.get(scope, scope.replace("_", " ").title()),
+                    status="idle",
+                    active=False,
+                    items_written=0,
+                )
+            )
+            continue
+        if state.last_success_at and (last_source_refresh_at is None or state.last_success_at > last_source_refresh_at):
+            last_source_refresh_at = state.last_success_at
+        scopes.append(
+            RefreshScopeRead(
+                scope=state.scope,
+                label=REFRESH_SCOPE_LABELS.get(state.scope, state.scope.replace("_", " ").title()),
+                status=state.status,
+                active=state.status in ACTIVE_REFRESH_STATUSES,
+                last_enqueued_at=state.last_enqueued_at,
+                last_started_at=state.last_started_at,
+                last_finished_at=state.last_finished_at,
+                last_success_at=state.last_success_at,
+                last_error=state.last_error,
+                items_written=state.items_written or 0,
+                updated_at=state.updated_at,
+            )
+        )
+    return RefreshStatusResponse(last_source_refresh_at=last_source_refresh_at, scopes=scopes)
+
+
 @router.get("", response_model=list[JobRead])
 def get_jobs(
     q: str | None = None,
@@ -416,6 +887,11 @@ def get_jobs(
     )
 
 
+@router.get("/refresh-status", response_model=RefreshStatusResponse)
+def get_refresh_status(db: Session = Depends(get_db)):
+    return _serialize_refresh_state_rows(db)
+
+
 @router.post("/search", response_model=list[JobRead])
 async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
     try:
@@ -423,161 +899,16 @@ async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
         profile_skills = _load_profile_skills(db)
         profile_hobbies = _load_profile_hobbies(db)
         requested_zip = (req.base_zip or "").strip() or None
-        aggressive_mode = bool(settings.aggressive_legal_mode)
-        pages = min(max(req.pages, 1), 12 if aggressive_mode else 8)
-        if not query:
-            # Auto-feed should pull a broad sample, otherwise one page can look like a narrow niche feed.
-            pages = max(pages, 2 if aggressive_mode else 1)
-        else:
-            # Query mode digs deeper so searches like "sales rep" or "line cook" don't miss later pages.
-            pages = max(pages, 10 if aggressive_mode else 6)
         limit = max(1, min(req.limit, 1000))
-        ingested: list[dict[str, Any]] = []
         remote_pref = (req.remote_type or "any").lower().strip()
         if remote_pref not in {"any", "local", "remote", "onsite", "hybrid"}:
             raise HTTPException(status_code=400, detail="remote_type must be any/local/remote/onsite/hybrid")
 
-        locations = _default_search_locations(requested_zip)
-        enabled_sources = db.scalars(select(JobSource).where(JobSource.enabled.is_(True))).all()
-
-        async def _safe_fetch(coro, timeout_seconds: float = 12.0) -> list[dict[str, Any]]:
-            try:
-                return await asyncio.wait_for(coro, timeout=timeout_seconds)
-            except Exception:
-                return []
-
-        pending_fetches: list[tuple[Any, float]] = []
-
-        def _queue(factory: Any, timeout_seconds: float) -> None:
-            pending_fetches.append((factory, timeout_seconds))
-
-        # Pull from configured sources first (company boards, RSS, etc.)
-        for src in enabled_sources:
-            try:
-                cfg = json.loads(src.config_json or "{}")
-            except json.JSONDecodeError:
-                cfg = {}
-            try:
-                st = (src.source_type or "").lower().strip()
-                if st == "greenhouse" and cfg.get("board_token"):
-                    token = cfg["board_token"]
-                    _queue(lambda token=token: ingestion.fetch_greenhouse(token), 8.0)
-                elif st == "lever" and cfg.get("company_slug"):
-                    slug = cfg["company_slug"]
-                    _queue(lambda slug=slug: ingestion.fetch_lever(slug), 8.0)
-                elif st == "rss" and cfg.get("rss_url"):
-                    rss_url = cfg["rss_url"]
-                    _queue(lambda rss_url=rss_url: ingestion.fetch_rss(rss_url), 8.0)
-                elif st == "adzuna":
-                    app_id = cfg.get("app_id") or settings.adzuna_app_id
-                    app_key = cfg.get("app_key") or settings.adzuna_app_key
-                    if app_id and app_key:
-                        for p in range(1, min(pages, 5 if aggressive_mode else 3) + 1):
-                            where = cfg.get("where", requested_zip or "Akron, OH")
-                            what = query or cfg.get("what", "jobs")
-                            _queue(
-                                lambda app_id=app_id, app_key=app_key, where=where, what=what, p=p: ingestion.fetch_adzuna(
-                                    app_id,
-                                    app_key,
-                                    where=where,
-                                    what=what,
-                                    page=p,
-                                )
-                                ,
-                                8.0,
-                            )
-                elif st == "themuse":
-                    for p in range(1, min(pages, 8 if aggressive_mode else 5) + 1):
-                        location = cfg.get("location", requested_zip or "Ohio")
-                        category = cfg.get("category")
-                        _queue(
-                            lambda location=location, category=category, p=p: ingestion.fetch_themuse(
-                                location=location,
-                                category=category,
-                                page=p,
-                            )
-                            ,
-                            8.0,
-                        )
-            except Exception:
-                continue
-
-        # Fallback broad pull to keep results flowing even with no configured sources.
-        fallback_locations = locations if query else locations[:3]
-        for location in fallback_locations:
-            for page in range(1, min(pages, 10 if aggressive_mode else 5) + 1):
-                try:
-                    _queue(lambda location=location, page=page: ingestion.fetch_themuse(location=location, page=page), 6.0)
-                except Exception:
-                    continue
-
-        if aggressive_mode:
-            local_focus_locations = locations[:6] if query else locations[:3]
-            local_focus_locations = local_focus_locations if local_focus_locations else []
-            if not local_focus_locations:
-                local_focus_locations = ["Akron, OH", "Cleveland, OH", "Ohio"]
-            for location in local_focus_locations:
-                for category in AGGRESSIVE_MUSE_CATEGORIES:
-                    for page in range(1, min(pages, 4 if query else 2) + 1):
-                        try:
-                            _queue(
-                                lambda location=location, category=category, page=page: ingestion.fetch_themuse(
-                                    location=location,
-                                    category=category,
-                                    page=page,
-                                ),
-                                7.0,
-                            )
-                        except Exception:
-                            continue
-
-            if query:
-                # Public company boards are useful for targeted searches, but too expensive for
-                # the default local auto-feed path.
-                for token in AGGRESSIVE_GREENHOUSE_TOKENS:
-                    try:
-                        _queue(lambda token=token: ingestion.fetch_greenhouse(token), 6.0)
-                    except Exception:
-                        continue
-                for slug in AGGRESSIVE_LEVER_SLUGS:
-                    try:
-                        _queue(lambda slug=slug: ingestion.fetch_lever(slug), 6.0)
-                    except Exception:
-                        continue
-
-        if settings.adzuna_app_id and settings.adzuna_app_key:
-            where = requested_zip or "United States"
-            for page in range(1, min(4 if aggressive_mode else 2, pages) + 1):
-                try:
-                    what = query or "jobs"
-                    _queue(
-                        lambda where=where, what=what, page=page: ingestion.fetch_adzuna(
-                            settings.adzuna_app_id,
-                            settings.adzuna_app_key,
-                            where=where,
-                            what=what,
-                            page=page,
-                        ),
-                        7.0,
-                    )
-                except Exception:
-                    continue
-
-        # Prevent runaway request fan-out.
-        max_tasks = 240 if (aggressive_mode and query) else (80 if aggressive_mode else 60)
-        if len(pending_fetches) > max_tasks:
-            pending_fetches = pending_fetches[:max_tasks]
-
-        if pending_fetches:
-            # Windows asyncio/select has a practical FD ceiling; run fetches in bounded batches.
-            batch_size = 8 if aggressive_mode else 6
-            for i in range(0, len(pending_fetches), batch_size):
-                batch = pending_fetches[i : i + batch_size]
-                coros = [_safe_fetch(factory(), timeout_seconds=timeout_seconds) for factory, timeout_seconds in batch]
-                fetched = await asyncio.gather(*coros, return_exceptions=True)
-                for chunk in fetched:
-                    if isinstance(chunk, list):
-                        ingested.extend(chunk)
+        cache_params = req.model_dump()
+        if not req.refresh_pool:
+            cached_rows = jobs_query_cache.get("search", cache_params)
+            if cached_rows is not None:
+                return [JobRead.model_validate(row) for row in cached_rows]
 
         query_tokens = [t for t in query.lower().split() if t] if query else []
         weak_tokens = {
@@ -611,89 +942,22 @@ async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
             if phrase in query_lower:
                 expanded_tokens.update(aliases)
 
-        def _matches_query(item: dict[str, Any]) -> bool:
-            if not query_tokens:
-                return True
-            title_company = f"{item.get('title', '')} {item.get('company', '')}".lower()
-            haystack = f"{title_company} {item.get('description', '')}".lower()
-            if query.lower() in haystack:
-                return True
+        if req.refresh_pool:
+            queued = enqueue_refresh(
+                _refresh_queue_key("search", req.model_dump(mode="python")),
+                _refresh_search_pool_async,
+                req.model_dump(mode="python"),
+            )
+            if queued:
+                mark_refresh_queued("local_search")
 
-            def _contains_word(text: str, token: str) -> bool:
-                return re.search(rf"\b{re.escape(token)}\b", text) is not None
-
-            if expanded_tokens:
-                title_hits = sum(1 for t in expanded_tokens if _contains_word(title_company, t))
-                if title_hits >= 1:
-                    return True
-                desc_hits = sum(1 for t in expanded_tokens if _contains_word(haystack, t))
-                if desc_hits >= 1:
-                    return True
-            token_hits = sum(1 for t in query_tokens if _contains_word(title_company, t))
-            return token_hits >= 1
-
-        def _raw_has_salary(item: dict[str, Any]) -> bool:
-            if item.get("pay_min") not in (None, "") or item.get("pay_max") not in (None, ""):
-                return True
-            text = str(item.get("pay_text") or item.get("salary") or "").strip().lower()
-            return bool(text) and "not listed" not in text
-
-        candidates: list[dict[str, Any]] = []
-        seen_urls: set[str] = set()
-        for item in ingested:
-            if not _matches_query(item):
-                continue
-            if not _raw_item_matches_profile(item, profile_skills, profile_hobbies):
-                continue
-            if req.salary_required and not _raw_has_salary(item):
-                continue
-            if req.exclude_confidential and _is_confidential_employer(item.get("company")):
-                continue
-            key = (item.get("canonical_url") or item.get("url") or "").strip()
-            if key:
-                if key in seen_urls:
-                    continue
-                seen_urls.add(key)
-            candidates.append(item)
-        if remote_pref == "local" and requested_zip:
-            def _local_priority(item: dict[str, Any]) -> tuple[int, float]:
-                remote_type = str(item.get("remote_type") or "unknown").lower().strip()
-                if remote_type == "remote":
-                    return (2, 9999.0)
-                target = infer_zip_from_location(
-                    item.get("location_text"),
-                    city=item.get("city"),
-                    state=item.get("state"),
-                )
-                dist = distance_from_base_zip(requested_zip, target)
-                if dist is not None:
-                    return (0, dist)
-                if _location_looks_local(requested_zip, item.get("location_text")):
-                    return (1, 0.0)
-                return (2, 9999.0)
-
-            candidates.sort(key=_local_priority)
-
-        # Keep ingestion responsive for page loads while still refreshing a broad set.
-        max_persist = _bounded_candidate_limit(
+        db_row_limit = _bounded_candidate_limit(
             limit,
-            multiplier=4 if query else 3,
-            minimum=140,
-            maximum=900 if aggressive_mode else 320,
+            multiplier=5 if query else 4,
+            minimum=120,
+            maximum=320,
         )
-        touched: dict[int, Job] = {}
-        for item in candidates[:max_persist]:
-            saved = create_or_update_job(db, item, profile_skills, commit=False)
-            touched[saved.id] = saved
-        if touched:
-            db.commit()
-
-        db_row_limit = _bounded_candidate_limit(limit, multiplier=12, minimum=220, maximum=1200)
         rows = list_jobs(db, {"q": query or None, "limit": db_row_limit})
-        if touched:
-            merged_rows = {row.id: row for row in rows}
-            merged_rows.update({row.id: row for row in touched.values()})
-            rows = list(merged_rows.values())
         serialized = _serialize_rows_with_dynamic_distance(
             rows=rows,
             db=db,
@@ -720,7 +984,6 @@ async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
             profile_hobbies=profile_hobbies,
         )
 
-        # Keep UX from dead-ending on niche queries by falling back to nearby jobs with current filters.
         if query and not filtered:
             fallback_rows = list_jobs(db, {"q": None, "limit": db_row_limit})
             fallback_serialized = _serialize_rows_with_dynamic_distance(
@@ -754,7 +1017,10 @@ async def search_jobs(req: JobSearchRequest, db: Session = Depends(get_db)):
                 )
             )
         diversified = _diversify_rows_by_company(filtered, max_per_company_first_pass=3 if query else 2)
-        return diversified[:limit]
+        result = diversified[:limit]
+        if not req.refresh_pool:
+            jobs_query_cache.set("search", cache_params, [row.model_dump(mode="json") for row in result])
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -839,6 +1105,19 @@ def recommendations(
     if remote_pref not in {"any", "local", "remote", "onsite", "hybrid"}:
         raise HTTPException(status_code=400, detail="remote_type must be any/local/remote/onsite/hybrid")
 
+    cache_params = {
+        "limit": limit,
+        "base_zip": base_zip,
+        "max_distance": max_distance,
+        "min_salary": min_salary,
+        "remote_type": remote_pref,
+        "salary_required": salary_required,
+        "exclude_confidential": exclude_confidential,
+    }
+    cached_rows = jobs_query_cache.get("recommendations", cache_params)
+    if cached_rows is not None:
+        return [JobRead.model_validate(row) for row in cached_rows]
+
     profile_skills = _load_profile_skills(db)
     profile_hobbies = _load_profile_hobbies(db)
     candidate_limit = _bounded_candidate_limit(
@@ -877,7 +1156,9 @@ def recommendations(
         )
     )
     diversified = _diversify_rows_by_company(serialized, max_per_company_first_pass=2)
-    return diversified[:limit]
+    result = diversified[:limit]
+    jobs_query_cache.set("recommendations", cache_params, [row.model_dump(mode="json") for row in result])
+    return result
 
 
 @router.post("/recommendations/national", response_model=list[JobRead])
@@ -893,123 +1174,29 @@ async def nationwide_recommendations(req: NationwideRecommendationRequest, db: S
         raise HTTPException(status_code=400, detail="zip_code must be a 5-digit ZIP")
 
     state_name, state_code = _normalize_state_value(req.state)
+    cache_params = req.model_dump()
+    if not req.refresh_pool:
+        cached_rows = jobs_query_cache.get("recommendations_national", cache_params)
+        if cached_rows is not None:
+            return [JobRead.model_validate(row) for row in cached_rows]
+
+    if req.refresh_pool:
+        queued = enqueue_refresh(
+            _refresh_queue_key("national", req.model_dump(mode="python")),
+            _refresh_national_pool_async,
+            req.model_dump(mode="python"),
+        )
+        if queued:
+            mark_refresh_queued("nationwide")
+
     search_locations, nationwide_scope = _build_national_locations(city, state_name, state_code, zip_code)
     profile = _load_profile_record(db)
     profile_skills = _load_profile_skills(db, profile)
     profile_hobbies = _load_profile_hobbies(db, profile)
     base_zip = ((req.base_zip or _load_profile_zip(db, profile) or settings.base_zip) or "").strip() or None
-    touched: dict[int, Job] = {}
-    ingested: list[dict[str, Any]] = []
-
-    if req.refresh_pool:
-        pending_fetches: list[tuple[Any, float]] = []
-
-        def _queue(factory: Any, timeout_seconds: float) -> None:
-            pending_fetches.append((factory, timeout_seconds))
-
-        pages_per_region = max(1, min(req.pages_per_region, 5))
-        muse_categories = AGGRESSIVE_MUSE_CATEGORIES[:4]
-
-        for location in search_locations:
-            for page in range(1, pages_per_region + 1):
-                _queue(lambda location=location, page=page: ingestion.fetch_themuse(location=location, page=page), 8.0)
-                if query and len(search_locations) <= 6:
-                    for category in muse_categories:
-                        _queue(
-                            lambda location=location, category=category, page=page: ingestion.fetch_themuse(
-                                location=location,
-                                category=category,
-                                page=page,
-                            ),
-                            8.0,
-                        )
-                elif nationwide_scope and page == 1:
-                    # Broaden role families for nationwide scans even without query text.
-                    for category in muse_categories[:2]:
-                        _queue(
-                            lambda location=location, category=category: ingestion.fetch_themuse(
-                                location=location,
-                                category=category,
-                                page=1,
-                            ),
-                            8.0,
-                        )
-            if settings.adzuna_app_id and settings.adzuna_app_key:
-                max_adzuna_pages = 1 if nationwide_scope else min(2, pages_per_region)
-                for page in range(1, max_adzuna_pages + 1):
-                    what = query or "jobs"
-                    _queue(
-                        lambda location=location, what=what, page=page: ingestion.fetch_adzuna(
-                            settings.adzuna_app_id,
-                            settings.adzuna_app_key,
-                            where=location,
-                            what=what,
-                            page=page,
-                        ),
-                        9.0,
-                    )
-
-        # Public company boards add breadth beyond location APIs.
-        for token in AGGRESSIVE_GREENHOUSE_TOKENS:
-            _queue(lambda token=token: ingestion.fetch_greenhouse(token), 8.0)
-        for slug in AGGRESSIVE_LEVER_SLUGS:
-            _queue(lambda slug=slug: ingestion.fetch_lever(slug), 8.0)
-
-        max_tasks = 180 if nationwide_scope else 120
-        if len(pending_fetches) > max_tasks:
-            pending_fetches = pending_fetches[:max_tasks]
-
-        async def _safe_fetch(coro, timeout_seconds: float) -> list[dict[str, Any]]:
-            try:
-                return await asyncio.wait_for(coro, timeout=timeout_seconds)
-            except Exception:
-                return []
-
-        batch_size = 8
-        for i in range(0, len(pending_fetches), batch_size):
-            batch = pending_fetches[i : i + batch_size]
-            coros = [_safe_fetch(factory(), timeout_seconds=timeout) for factory, timeout in batch]
-            fetched = await asyncio.gather(*coros, return_exceptions=True)
-            for chunk in fetched:
-                if isinstance(chunk, list):
-                    ingested.extend(chunk)
-
-        seen_keys: set[str] = set()
-        candidates: list[dict[str, Any]] = []
-        for item in ingested:
-            if not _raw_item_matches_query(item, query):
-                continue
-            if not _raw_item_matches_profile(item, profile_skills, profile_hobbies):
-                continue
-            if req.salary_required and not _raw_item_has_salary(item):
-                continue
-            if req.exclude_confidential and _is_confidential_employer(item.get("company")):
-                continue
-            dedupe_key = (item.get("canonical_url") or item.get("url") or "").strip().lower()
-            if dedupe_key and dedupe_key in seen_keys:
-                continue
-            if dedupe_key:
-                seen_keys.add(dedupe_key)
-            candidates.append(item)
-
-        max_persist = _bounded_candidate_limit(
-            req.limit,
-            multiplier=18 if nationwide_scope else 12,
-            minimum=160,
-            maximum=1200 if nationwide_scope else 700,
-        )
-        for item in candidates[:max_persist]:
-            saved = create_or_update_job(db, item, profile_skills, commit=False)
-            touched[saved.id] = saved
-        if touched:
-            db.commit()
 
     db_row_limit = _bounded_candidate_limit(req.limit, multiplier=12, minimum=220, maximum=900)
     rows = list_jobs(db, {"q": query or None, "limit": db_row_limit})
-    if touched:
-        merged_rows = {row.id: row for row in rows}
-        merged_rows.update({row.id: row for row in touched.values()})
-        rows = list(merged_rows.values())
 
     serialized = _serialize_rows_with_dynamic_distance(rows=rows, db=db, base_zip=base_zip, max_distance=None)
     filtered = _filter_serialized_rows(
@@ -1078,8 +1265,6 @@ async def nationwide_recommendations(req: NationwideRecommendationRequest, db: S
                 break
         ranked = list(by_id.values())
 
-    # Final safety fill so nationwide panel still returns useful recommendations
-    # even when strict threshold gates are too narrow for the current pool.
     if len(ranked) < req.limit and filtered:
         present = {row.id for row in ranked}
         fill_candidates = [row for row in filtered if row.id not in present]
@@ -1108,7 +1293,10 @@ async def nationwide_recommendations(req: NationwideRecommendationRequest, db: S
         )
     )
     diversified = _diversify_rows_by_company(ranked, max_per_company_first_pass=1 if nationwide_scope else 2)
-    return diversified[: req.limit]
+    result = diversified[: req.limit]
+    if not req.refresh_pool:
+        jobs_query_cache.set("recommendations_national", cache_params, [row.model_dump(mode="json") for row in result])
+    return result
 
 
 @router.get("/dashboard/metrics", response_model=DashboardResponse)
@@ -1160,6 +1348,7 @@ async def ingest_jobs(request: IngestRequest, db: Session = Depends(get_db)):
     results = [create_or_update_job(db, item, profile_skills, commit=False) for item in normalized]
     if results:
         db.commit()
+        invalidate_jobs_query_cache()
     return [_serialize_job(r) for r in results]
 
 
@@ -1196,6 +1385,8 @@ def bulk_action(req: BulkActionRequest, db: Session = Depends(get_db)):
         updated += 1
 
     db.commit()
+    if updated or deleted:
+        invalidate_jobs_query_cache()
     return BulkActionResponse(updated=updated, deleted=deleted)
 
 
@@ -1284,6 +1475,7 @@ def rescore_all_jobs(db: Session = Depends(get_db)):
     profile.updated_at = now
     db.add(profile)
     db.commit()
+    invalidate_jobs_query_cache()
     return RescoreAllResponse(
         rescored_count=rescored_count,
         score_tuning_mode=score_tuning_mode,
@@ -1347,6 +1539,7 @@ def update_job(job_id: int, update: JobUpdate, db: Session = Depends(get_db)):
     db.add(job)
     db.commit()
     db.refresh(job)
+    invalidate_jobs_query_cache()
     return _serialize_job(job)
 
 
@@ -1362,6 +1555,7 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
 
     db.delete(job)
     db.commit()
+    invalidate_jobs_query_cache()
     return {"ok": True}
 
 

@@ -9,6 +9,7 @@ from app.db.session import get_db
 from app.models.profile import UserProfile
 from app.schemas.profile import ProfileRead, ProfileUpdate, ResumeUploadResponse
 from app.services.extraction import extract_skills
+from app.services.query_cache import invalidate_jobs_query_cache
 from app.services.resume_parser import extract_resume_text
 
 router = APIRouter(prefix="/profile", tags=["profile"])
@@ -82,6 +83,7 @@ def update_profile(payload: ProfileUpdate, db: Session = Depends(get_db)):
     db.add(profile)
     db.commit()
     db.refresh(profile)
+    invalidate_jobs_query_cache()
     return _serialize(profile)
 
 
@@ -117,6 +119,7 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
         )
     db.add(profile)
     db.commit()
+    invalidate_jobs_query_cache()
 
     return ResumeUploadResponse(
         resume_path=str(target),
