@@ -124,6 +124,53 @@ class BatchMaterialResponse(BaseModel):
     combined_packet_text: str = ""
 
 
+class StatusEventRead(BaseModel):
+    id: int
+    job_id: int
+    previous_status: str | None = None
+    new_status: str
+    action_source: str = "manual"
+    note: str | None = None
+    created_at: datetime
+
+
+class PacketHistoryRead(BaseModel):
+    id: int
+    job_id: int
+    packet_text: str
+    ats_keywords: list[str] = Field(default_factory=list)
+    resume_bullet_suggestions: list[str] = Field(default_factory=list)
+    cover_letter_draft: str | None = None
+    outreach_message_draft: str
+    openai_used: bool = False
+    generated_via: str = "single"
+    created_at: datetime
+
+
+class JobHistoryResponse(BaseModel):
+    status_events: list[StatusEventRead] = Field(default_factory=list)
+    packet_history: list[PacketHistoryRead] = Field(default_factory=list)
+
+
+class SourcePerformanceRead(BaseModel):
+    source: str
+    total_jobs: int = 0
+    active_pipeline: int = 0
+    applied_count: int = 0
+    interview_count: int = 0
+    offer_count: int = 0
+    response_rate: float = 0.0
+    interview_rate: float = 0.0
+    avg_final_score: float = 0.0
+    avg_expected_value: float = 0.0
+
+
+class PacketMetricsRead(BaseModel):
+    total_generated: int = 0
+    generated_last_7_days: int = 0
+    last_generated_at: datetime | None = None
+
+
 class IngestRequest(BaseModel):
     source: str
     payload: dict[str, Any]
@@ -177,11 +224,17 @@ class DashboardResponse(BaseModel):
     by_status: dict[str, int]
     by_role_category: dict[str, int]
     weekly_trend: dict[str, int]
+    outcome_counts: dict[str, int] = Field(default_factory=dict)
+    response_rate: float = 0.0
+    source_performance: list[SourcePerformanceRead] = Field(default_factory=list)
+    recent_activity: list[StatusEventRead] = Field(default_factory=list)
+    packet_metrics: PacketMetricsRead = Field(default_factory=PacketMetricsRead)
 
 
 class BulkActionRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
     action: str
+    action_source: str = "bulk_ui"
 
 
 class BulkActionResponse(BaseModel):

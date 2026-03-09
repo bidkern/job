@@ -13,8 +13,10 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models.job import Job
 from app.models.job_material import JobMaterial
-from app.models.profile import UserProfile
+from app.models.job_packet_history import JobPacketHistory
 from app.models.job_source import JobSource
+from app.models.job_status_event import JobStatusEvent
+from app.models.profile import UserProfile
 from app.schemas.job import (
     BatchMaterialPacket,
     BatchMaterialRequest,
@@ -24,17 +26,20 @@ from app.schemas.job import (
     CompanySiteDiscoverRequest,
     DashboardResponse,
     IngestRequest,
+    JobHistoryResponse,
     JobRead,
     JobSearchRequest,
     JobUpdate,
     MaterialRequest,
     MaterialResponse,
     NationwideRecommendationRequest,
+    PacketHistoryRead,
     RefreshNowRequest,
     RefreshNowResponse,
     RefreshScopeRead,
     RefreshStatusResponse,
     RescoreAllResponse,
+    StatusEventRead,
 )
 from app.services import ingestion
 from app.services.job_service import create_or_update_job, get_dashboard_metrics, get_job_match_snippets, list_jobs
@@ -115,6 +120,58 @@ def _apply_applied_followup_rule(job: Job, old_status: str) -> None:
             reminders = json.loads(job.reminders or "[]")
             reminders.append(f"Follow up by {job.follow_up_date.date().isoformat()} for application check-in")
             job.reminders = json.dumps(reminders)
+
+
+def _record_status_event(
+    db: Session,
+    *,
+    job_id: int,
+    previous_status: str | None,
+    new_status: str | None,
+    action_source: str = "manual",
+    note: str | None = None,
+) -> None:
+    next_status = (new_status or "").strip().lower()
+    prior_status = (previous_status or "").strip().lower() or None
+    if not next_status or next_status == prior_status:
+        return
+    db.add(
+        JobStatusEvent(
+            job_id=job_id,
+            previous_status=prior_status,
+            new_status=next_status,
+            action_source=(action_source or "manual").strip().lower() or "manual",
+            note=(note or "").strip() or None,
+            created_at=datetime.utcnow(),
+        )
+    )
+
+
+def _serialize_status_event(row: JobStatusEvent) -> StatusEventRead:
+    return StatusEventRead(
+        id=row.id,
+        job_id=row.job_id,
+        previous_status=row.previous_status,
+        new_status=row.new_status,
+        action_source=row.action_source,
+        note=row.note,
+        created_at=row.created_at,
+    )
+
+
+def _serialize_packet_history(row: JobPacketHistory) -> PacketHistoryRead:
+    return PacketHistoryRead(
+        id=row.id,
+        job_id=row.job_id,
+        packet_text=row.packet_text,
+        ats_keywords=json.loads(row.ats_keywords or "[]"),
+        resume_bullet_suggestions=json.loads(row.resume_bullet_suggestions or "[]"),
+        cover_letter_draft=row.cover_letter_draft,
+        outreach_message_draft=row.outreach_message_draft,
+        openai_used=bool(row.openai_used),
+        generated_via=row.generated_via,
+        created_at=row.created_at,
+    )
 
 
 def _default_search_locations(base_zip: str | None) -> list[str]:
@@ -1508,6 +1565,7 @@ async def ingest_jobs(request: IngestRequest, db: Session = Depends(get_db)):
 @router.post("/bulk-action", response_model=BulkActionResponse)
 def bulk_action(req: BulkActionRequest, db: Session = Depends(get_db)):
     action = (req.action or "").lower().strip()
+    action_source = (req.action_source or "bulk_ui").strip().lower() or "bulk_ui"
     updated = 0
     deleted = 0
 
@@ -1533,6 +1591,13 @@ def bulk_action(req: BulkActionRequest, db: Session = Depends(get_db)):
         else:
             job.status = "rejected"
         _apply_applied_followup_rule(job, old_status)
+        _record_status_event(
+            db,
+            job_id=job.id,
+            previous_status=old_status,
+            new_status=job.status,
+            action_source=action_source,
+        )
         job.updated_at = datetime.utcnow()
         db.add(job)
         updated += 1
@@ -1688,16 +1753,55 @@ def _packet_text_from_materials(job: Job, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _maybe_store_packet_history(
+    db: Session,
+    *,
+    job: Job,
+    payload: dict[str, Any],
+    generated_via: str,
+) -> None:
+    packet_text = _packet_text_from_materials(job, payload)
+    latest = (
+        db.query(JobPacketHistory)
+        .filter(JobPacketHistory.job_id == job.id)
+        .order_by(JobPacketHistory.created_at.desc(), JobPacketHistory.id.desc())
+        .first()
+    )
+    if latest and latest.packet_text == packet_text:
+        return
+
+    db.add(
+        JobPacketHistory(
+            job_id=job.id,
+            packet_text=packet_text,
+            ats_keywords=json.dumps(payload.get("ats_keywords") or []),
+            resume_bullet_suggestions=json.dumps(payload.get("resume_bullet_suggestions") or []),
+            cover_letter_draft=payload.get("cover_letter_draft"),
+            outreach_message_draft=payload.get("outreach_message_draft") or "",
+            openai_used=bool(payload.get("openai_used")),
+            generated_via=(generated_via or "single").strip().lower(),
+            created_at=datetime.utcnow(),
+        )
+    )
+
+
 async def _load_or_generate_material_payload(
     job: Job,
     req: MaterialRequest,
     db: Session,
     *,
     commit: bool,
+    generated_via: str = "single",
 ) -> tuple[dict[str, Any], bool]:
     stored = db.query(JobMaterial).filter(JobMaterial.job_id == job.id).first()
     if stored:
-        return _job_material_payload(stored), False
+        payload = _job_material_payload(stored)
+        _maybe_store_packet_history(db, job=job, payload=payload, generated_via=generated_via)
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        return payload, False
 
     profile = _load_profile_record(db)
     blocked_hobbies = {_normalize_phrase(x) for x in _load_profile_hobbies(db, profile)}
@@ -1720,6 +1824,7 @@ async def _load_or_generate_material_payload(
         generated_at=datetime.utcnow(),
     )
     db.add(material)
+    _maybe_store_packet_history(db, job=job, payload=data, generated_via=generated_via)
     if commit:
         db.commit()
         db.refresh(material)
@@ -1759,7 +1864,13 @@ async def materials_batch(req: BatchMaterialRequest, db: Session = Depends(get_d
             job = jobs_by_id.get(job_id)
             if not job:
                 continue
-            data, generated = await _load_or_generate_material_payload(job, material_req, db, commit=False)
+            data, generated = await _load_or_generate_material_payload(
+                job,
+                material_req,
+                db,
+                commit=False,
+                generated_via="batch",
+            )
             if generated:
                 generated_count += 1
             packets.append(
@@ -1790,6 +1901,31 @@ async def materials_batch(req: BatchMaterialRequest, db: Session = Depends(get_d
         generated_count=generated_count,
         packets=packets,
         combined_packet_text=combined_packet_text,
+    )
+
+
+@router.get("/{job_id}/history", response_model=JobHistoryResponse)
+def job_history(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status_events = db.scalars(
+        select(JobStatusEvent)
+        .where(JobStatusEvent.job_id == job_id)
+        .order_by(JobStatusEvent.created_at.desc())
+        .limit(20)
+    ).all()
+    packet_history_rows = db.scalars(
+        select(JobPacketHistory)
+        .where(JobPacketHistory.job_id == job_id)
+        .order_by(JobPacketHistory.created_at.desc())
+        .limit(20)
+    ).all()
+
+    return JobHistoryResponse(
+        status_events=[_serialize_status_event(row) for row in status_events],
+        packet_history=[_serialize_packet_history(row) for row in packet_history_rows],
     )
 
 
@@ -1843,6 +1979,14 @@ def update_job(job_id: int, update: JobUpdate, db: Session = Depends(get_db)):
             setattr(job, key, value)
 
     _apply_applied_followup_rule(job, old_status)
+    _record_status_event(
+        db,
+        job_id=job.id,
+        previous_status=old_status,
+        new_status=job.status,
+        action_source="manual_update",
+        note=values.get("notes") if "notes" in values else None,
+    )
 
     job.updated_at = datetime.utcnow()
     db.add(job)
@@ -1873,7 +2017,7 @@ async def materials(job_id: int, req: MaterialRequest, db: Session = Depends(get
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    data, _ = await _load_or_generate_material_payload(job, req, db, commit=True)
+    data, _ = await _load_or_generate_material_payload(job, req, db, commit=True, generated_via="single")
     return MaterialResponse(
         ats_keywords=data["ats_keywords"],
         resume_bullet_suggestions=data["resume_bullet_suggestions"],

@@ -46,6 +46,43 @@ def run_migrations(engine: Engine) -> None:
         conn.execute(
             text(
                 """
+                CREATE TABLE IF NOT EXISTS job_status_events (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL,
+                    previous_status VARCHAR(30),
+                    new_status VARCHAR(30) NOT NULL,
+                    action_source VARCHAR(40) NOT NULL DEFAULT 'manual',
+                    note TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                )
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS job_packet_history (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL,
+                    packet_text TEXT NOT NULL,
+                    ats_keywords TEXT NOT NULL,
+                    resume_bullet_suggestions TEXT NOT NULL,
+                    cover_letter_draft TEXT,
+                    outreach_message_draft TEXT NOT NULL,
+                    openai_used BOOLEAN NOT NULL DEFAULT 0,
+                    generated_via TEXT NOT NULL DEFAULT 'single',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                )
+                """
+            )
+        )
+
+        conn.execute(
+            text(
+                """
                 CREATE TABLE IF NOT EXISTS automation_runs (
                     id INTEGER PRIMARY KEY,
                     run_started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -134,6 +171,9 @@ def run_migrations(engine: Engine) -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_jobs_salary_bounds ON jobs(pay_max, pay_min)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_refresh_states_scope ON refresh_states(scope)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_job_status_events_job_created ON job_status_events(job_id, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_job_status_events_status_created ON job_status_events(new_status, created_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_job_packet_history_job_created ON job_packet_history(job_id, created_at DESC)"))
 
         conn.execute(
             text(

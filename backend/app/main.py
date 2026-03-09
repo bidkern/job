@@ -9,7 +9,16 @@ from app.api.profile import router as profile_router
 from app.core.config import settings
 from app.db.migrations import run_migrations
 from app.db.session import Base, engine
-from app.models import automation_run, job, job_material, job_source, profile, refresh_state  # noqa: F401
+from app.models import (  # noqa: F401
+    automation_run,
+    job,
+    job_material,
+    job_packet_history,
+    job_source,
+    job_status_event,
+    profile,
+    refresh_state,
+)
 from app.services.background_refresh import start_refresh_queue, stop_refresh_queue
 from app.services.scheduler import start_scheduler, stop_scheduler
 

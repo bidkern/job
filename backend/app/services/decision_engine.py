@@ -18,6 +18,14 @@ SUSPICIOUS_TEXT_RE = re.compile(r"\b(?:urgent hire|wire transfer|crypto payment|
 LOW_SIGNAL_TITLE_RE = re.compile(r"\b(?:rockstar|ninja|guru|wizard)\b", re.IGNORECASE)
 HIGH_FRICTION_RE = re.compile(r"\b(?:cover letter|required assessment|take-home|portfolio required|multi-step)\b", re.IGNORECASE)
 LOW_FRICTION_RE = re.compile(r"\b(?:easy apply|quick apply|one click|short application)\b", re.IGNORECASE)
+STAFFING_TEXT_RE = re.compile(
+    r"\b(?:staffing|recruitment|recruiting firm|employment agency|our client|contract[- ]to[- ]hire|temp[- ]to[- ]hire|talent solutions|headhunter)\b",
+    re.IGNORECASE,
+)
+GHOST_JOB_TEXT_RE = re.compile(
+    r"\b(?:evergreen role|future opportunity|talent community|always hiring|pipeline role|continuous openings)\b",
+    re.IGNORECASE,
+)
 
 
 def _clamp01(value: float) -> float:
@@ -39,28 +47,41 @@ def _quality_risk(
     pay_min: float | None,
     pay_max: float | None,
     source: str | None,
-) -> float:
+) -> tuple[float, list[str]]:
     text = (description or "").lower()
     risk = 0.16
+    reasons: list[str] = []
     if len(text) < 320:
         risk += 0.12
+        reasons.append("Short or low-signal description")
     if (pay_min or pay_max) is None:
         risk += 0.08
+        reasons.append("Salary missing")
     if LOW_SIGNAL_TITLE_RE.search(title or ""):
         risk += 0.10
+        reasons.append("Low-signal title wording")
     if SUSPICIOUS_TEXT_RE.search(text):
         risk += 0.25
+        reasons.append("Suspicious wording")
+    if STAFFING_TEXT_RE.search(text):
+        risk += 0.18
+        reasons.append("Staffing or recruiter language")
+    if GHOST_JOB_TEXT_RE.search(text):
+        risk += 0.14
+        reasons.append("Evergreen or pipeline-job language")
     if posted_date:
         now = datetime.now(timezone.utc)
         dt = posted_date if posted_date.tzinfo else posted_date.replace(tzinfo=timezone.utc)
         age_days = max(0, (now - dt).days)
         if age_days > 45:
             risk += 0.16
+            reasons.append("Stale posting age")
         elif age_days > 21:
             risk += 0.08
+            reasons.append("Older posting age")
     trust = SOURCE_TRUST.get((source or "").lower(), 0.6)
     risk -= (trust - 0.6) * 0.18
-    return _clamp01(risk)
+    return _clamp01(risk), reasons[:5]
 
 
 def _application_friction(description: str | None, url: str | None, source: str | None) -> float:
@@ -236,7 +257,7 @@ def build_decision_metrics(
     )
     soft_match = _soft_match(role_score, skill_transferable_ratio, resume_strength)
 
-    quality_risk = _quality_risk(
+    quality_risk, quality_penalty_reasons = _quality_risk(
         title=title,
         description=description,
         posted_date=posted_date,
@@ -329,5 +350,5 @@ def build_decision_metrics(
         "required_snippets": required_snippets[:4],
         "degree_required_detected": degree_required,
         "required_years_detected": required_years,
+        "quality_penalty_reasons": quality_penalty_reasons,
     }
-

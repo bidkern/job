@@ -839,7 +839,7 @@ export default function JobsPage() {
     await copySprintPacket(currentSprintJob);
 
     try {
-      await api.bulkAction([currentSprintJob.id], "apply");
+      await api.bulkAction([currentSprintJob.id], "apply", "sprint_mode");
       applyStatusToLists(new Set([currentSprintJob.id]), "applied");
       setNotice(`Applied ${currentSprintJob.title} and moved to next job.`);
       if (sprintIndex < sprintQueueIds.length - 1) {
@@ -860,7 +860,7 @@ export default function JobsPage() {
     jobsToOpen.forEach((job) => openJobListing(job));
 
     try {
-      await api.bulkAction(ids, "apply");
+      await api.bulkAction(ids, "apply", "quick_apply");
       applyStatusToLists(idSet, "applied");
       if (panel === "local") setSelectedLocal(new Set());
       else setSelectedNationwide(new Set());
@@ -880,7 +880,7 @@ export default function JobsPage() {
     const ids = panel === "local" ? Array.from(selectedLocal) : Array.from(selectedNationwide);
     if (ids.length === 0) return;
     try {
-      await api.bulkAction(ids, action);
+      await api.bulkAction(ids, action, "bulk_toolbar");
       const idSet = new Set(ids);
       if (action === "delete") {
         removeFromLists(idSet);
@@ -906,7 +906,7 @@ export default function JobsPage() {
   async function saveRecommendedJob(job) {
     if (!job?.id) return;
     try {
-      await api.bulkAction([job.id], "save");
+      await api.bulkAction([job.id], "save", "recommendation_card");
       applyStatusToLists(new Set([job.id]), "saved");
       setNotice(`Saved ${job.title}.`);
     } catch (e) {

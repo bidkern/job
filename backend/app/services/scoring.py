@@ -638,6 +638,10 @@ def score_job(
             "transferable_groups": skill_details["matched_transferable_groups"],
             "signal_sparse": skill_details["signal_sparse"],
         },
+        "quality_signals": {
+            "realness_risk": round(float(decision_metrics.get("realness_risk") or 0.0), 4),
+            "penalty_reasons": list(decision_metrics.get("quality_penalty_reasons") or []),
+        },
         "seniority_signal": seniority_signal,
         "matched_role_categories": matched_roles,
         "why_ranked_high": [
@@ -656,6 +660,11 @@ def score_job(
             ),
             seniority_reason,
             hobby_reason,
+            (
+                f"Quality penalties: {', '.join(decision_metrics.get('quality_penalty_reasons') or [])}"
+                if decision_metrics.get("quality_penalty_reasons")
+                else "No major spam/staffing risk signals detected"
+            ),
             str(decision_metrics.get("reason_summary") or ""),
         ],
     }

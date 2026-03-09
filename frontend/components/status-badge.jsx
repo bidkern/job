@@ -5,6 +5,10 @@ export function StatusBadge({ status }) {
     ready: "info",
     applied: "warning",
     interview: "success",
+    final_round: "success",
+    offer: "success",
+    no_response: "warning",
+    declined: "default",
     rejected: "danger",
   };
 
@@ -20,7 +24,7 @@ export function StatusBadge({ status }) {
 
   return (
     <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${variantClass[variant]}`}>
-      {(status || "new").toLowerCase()}
+      {(status || "new").toLowerCase().replaceAll("_", " ")}
     </span>
   );
 }

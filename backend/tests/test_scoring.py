@@ -178,3 +178,37 @@ def test_hobby_blend_increases_match_for_hobby_aligned_roles():
     assert aligned["hobbies_influence_percent"] == 8
     assert aligned["resume_influence_percent"] == 92
     assert aligned["hobby_signals"]["active"] is True
+
+
+def test_staffing_language_increases_realness_risk():
+    _, direct_breakdown = score_job(
+        title="Operations Coordinator",
+        description="Coordinate reporting, inventory, and customer communication for a growing operations team.",
+        job_skills=["operations", "inventory", "reporting"],
+        profile_skills=["inventory", "customer service", "communication", "operations"],
+        distance_miles=10,
+        remote_type="onsite",
+        pay_min=48000,
+        pay_max=56000,
+        posted_date=datetime.now(timezone.utc) - timedelta(days=2),
+        source="greenhouse",
+    )
+    _, staffing_breakdown = score_job(
+        title="Operations Coordinator",
+        description=(
+            "Our client is hiring through a staffing agency for a contract-to-hire opening. "
+            "Coordinate reporting, inventory, and customer communication for a growing operations team."
+        ),
+        job_skills=["operations", "inventory", "reporting"],
+        profile_skills=["inventory", "customer service", "communication", "operations"],
+        distance_miles=10,
+        remote_type="onsite",
+        pay_min=48000,
+        pay_max=56000,
+        posted_date=datetime.now(timezone.utc) - timedelta(days=2),
+        source="adzuna",
+    )
+    direct_risk = direct_breakdown["quality_signals"]["realness_risk"]
+    staffing_risk = staffing_breakdown["quality_signals"]["realness_risk"]
+    assert staffing_risk > direct_risk
+    assert any("staffing" in reason.lower() for reason in staffing_breakdown["quality_signals"]["penalty_reasons"])

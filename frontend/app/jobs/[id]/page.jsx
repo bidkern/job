@@ -28,9 +28,9 @@ function cleanDescriptionText(text) {
     .replace(/<\/(p|div|li|h1|h2|h3|h4|h5|h6)>/gi, "\n")
     .replace(/<li[^>]*>/gi, "- ")
     .replace(/<[^>]+>/g, " ")
-    .replace(/â€“|â€”/g, "-")
-    .replace(/â€˜|â€™/g, "'")
-    .replace(/â€œ|â€/g, '"')
+    .replace(/Ã¢â‚¬â€œ|Ã¢â‚¬â€/g, "-")
+    .replace(/Ã¢â‚¬Ëœ|Ã¢â‚¬â„¢/g, "'")
+    .replace(/Ã¢â‚¬Å“|Ã¢â‚¬Â/g, '"')
     .replace(/\u00a0/g, " ")
     .replace(/\s+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -38,23 +38,72 @@ function cleanDescriptionText(text) {
   return stripped.trim() || "No description available.";
 }
 
+async function copyText(text) {
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function eventLabel(value) {
+  return String(value || "").replaceAll("_", " ");
+}
+
 export default function JobDetailPage({ params }) {
   const [job, setJob] = useState(null);
+  const [history, setHistory] = useState({ status_events: [], packet_history: [] });
+  const [profile, setProfile] = useState({ skills: [] });
   const [msg, setMsg] = useState("");
+  const [error, setError] = useState("");
+  const [loadingPacket, setLoadingPacket] = useState(false);
 
-  async function load() {
-    const data = await api.getJob(params.id);
-    setJob(data);
+  async function loadAll() {
+    const [jobData, historyData, profileData] = await Promise.all([
+      api.getJob(params.id),
+      api.getJobHistory(params.id).catch(() => ({ status_events: [], packet_history: [] })),
+      api.getProfile().catch(() => ({ skills: [] })),
+    ]);
+    setJob(jobData);
+    setHistory(historyData || { status_events: [], packet_history: [] });
+    setProfile(profileData || { skills: [] });
   }
 
   useEffect(() => {
-    load();
+    loadAll().catch((e) => setError(e.message || "Failed to load job details."));
   }, [params.id]);
 
   async function setStatus(status) {
     await api.updateJob(params.id, { status });
     setMsg(`Status updated to ${status}`);
-    await load();
+    await loadAll();
+  }
+
+  async function generatePacket() {
+    setLoadingPacket(true);
+    setError("");
+    try {
+      await api.generateMaterials(params.id, {
+        profile_skills: Array.isArray(profile?.skills) ? profile.skills : [],
+        experience_areas: Array.isArray(profile?.skills) ? profile.skills.slice(0, 10) : [],
+        include_cover_letter: true,
+      });
+      setMsg("Saved packet generated.");
+      await loadAll();
+    } catch (e) {
+      setError(e.message || "Could not generate packet.");
+    } finally {
+      setLoadingPacket(false);
+    }
+  }
+
+  async function copyLatestPacket() {
+    const latest = history?.packet_history?.[0];
+    if (!latest?.packet_text) return;
+    const ok = await copyText(latest.packet_text);
+    setMsg(ok ? "Latest packet copied." : "Could not copy latest packet.");
   }
 
   if (!job) return <p className="text-sm text-muted-foreground">Loading job details...</p>;
@@ -76,6 +125,7 @@ export default function JobDetailPage({ params }) {
       </div>
 
       {msg ? <p className="text-sm text-emerald-600">{msg}</p> : null}
+      {error ? <p className="text-sm text-red-600">{error}</p> : null}
 
       <Card>
         <CardHeader>
@@ -104,6 +154,7 @@ export default function JobDetailPage({ params }) {
       <Card>
         <CardHeader>
           <CardTitle>Actions</CardTitle>
+          <CardDescription>Save progress, generate reusable packet text, and keep history attached to this job.</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-2">
           {job.url ? (
@@ -113,9 +164,80 @@ export default function JobDetailPage({ params }) {
           ) : null}
           <Button onClick={() => setStatus("saved")} variant="secondary">Save</Button>
           <Button onClick={() => setStatus("applied")}>Apply</Button>
+          <Button onClick={() => setStatus("interview")} variant="outline">Interview</Button>
+          <Button onClick={() => setStatus("final_round")} variant="outline">Final Round</Button>
+          <Button onClick={() => setStatus("offer")} variant="outline">Offer</Button>
+          <Button onClick={() => setStatus("no_response")} variant="outline">No Response</Button>
+          <Button onClick={() => setStatus("declined")} variant="outline">Declined</Button>
           <Button onClick={() => setStatus("rejected")} variant="destructive">Reject</Button>
+          <Button onClick={generatePacket} variant="outline" disabled={loadingPacket}>
+            {loadingPacket ? "Generating..." : "Generate Saved Packet"}
+          </Button>
+          <Button onClick={copyLatestPacket} variant="outline" disabled={!history?.packet_history?.length}>
+            Copy Latest Packet
+          </Button>
         </CardContent>
       </Card>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Application History</CardTitle>
+            <CardDescription>Status and outcome changes for this job.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            {(history?.status_events || []).length === 0 ? (
+              <p className="text-muted-foreground">No saved status history yet.</p>
+            ) : (
+              history.status_events.map((event) => (
+                <div key={event.id} className="rounded-md border p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-medium">
+                      {event.previous_status ? `${eventLabel(event.previous_status)} -> ` : ""}
+                      {eventLabel(event.new_status)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</p>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">Source: {eventLabel(event.action_source)}</p>
+                  {event.note ? <p className="mt-1 text-xs text-muted-foreground">{event.note}</p> : null}
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Saved Packet History</CardTitle>
+            <CardDescription>Stored outreach/resume packet generations for this job.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            {(history?.packet_history || []).length === 0 ? (
+              <p className="text-muted-foreground">No saved packets yet.</p>
+            ) : (
+              history.packet_history.map((packet) => (
+                <div key={packet.id} className="rounded-md border p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-medium">Generated via {eventLabel(packet.generated_via)}</p>
+                    <p className="text-xs text-muted-foreground">{new Date(packet.created_at).toLocaleString()}</p>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {packet.openai_used ? "OpenAI-assisted" : "Offline/default"} packet
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button size="sm" variant="outline" onClick={() => copyText(packet.packet_text).then((ok) => setMsg(ok ? "Packet copied." : "Could not copy packet."))}>
+                      Copy Packet
+                    </Button>
+                  </div>
+                  <pre className="mt-2 max-h-52 overflow-y-auto rounded-md border bg-secondary/40 p-3 text-xs whitespace-pre-wrap">
+                    {packet.packet_text}
+                  </pre>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader>

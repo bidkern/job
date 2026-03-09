@@ -57,9 +57,11 @@ export const api = {
     return request(`/jobs${q.toString() ? `?${q.toString()}` : ""}`);
   },
   getJob: (id) => request(`/jobs/${id}`),
+  getJobHistory: (id) => request(`/jobs/${id}/history`),
   updateJob: (id, body) => request(`/jobs/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteJob: (id) => request(`/jobs/${id}`, { method: "DELETE" }),
-  bulkAction: (ids, action) => request(`/jobs/bulk-action`, { method: "POST", body: JSON.stringify({ ids, action }) }),
+  bulkAction: (ids, action, actionSource = "bulk_ui") =>
+    request(`/jobs/bulk-action`, { method: "POST", body: JSON.stringify({ ids, action, action_source: actionSource }) }),
   generateMaterials: (id, body) => request(`/jobs/${id}/materials`, { method: "POST", body: JSON.stringify(body) }),
   generateMaterialsBatch: (body) => request("/jobs/materials/batch", { method: "POST", body: JSON.stringify(body), timeoutMs: 45000 }),
   getMetrics: () => request("/jobs/dashboard/metrics"),
