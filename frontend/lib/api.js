@@ -58,6 +58,13 @@ export const api = {
   },
   getJob: (id) => request(`/jobs/${id}`),
   getJobHistory: (id) => request(`/jobs/${id}/history`),
+  getAppliedWorkspace: (params = {}) => {
+    const q = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== "" && v !== undefined && v !== null) q.set(k, String(v));
+    });
+    return request(`/jobs/workspace/applied${q.toString() ? `?${q.toString()}` : ""}`);
+  },
   updateJob: (id, body) => request(`/jobs/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteJob: (id) => request(`/jobs/${id}`, { method: "DELETE" }),
   bulkAction: (ids, action, actionSource = "bulk_ui") =>

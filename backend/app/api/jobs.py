@@ -18,6 +18,7 @@ from app.models.job_source import JobSource
 from app.models.job_status_event import JobStatusEvent
 from app.models.profile import UserProfile
 from app.schemas.job import (
+    AppliedWorkspaceResponse,
     BatchMaterialPacket,
     BatchMaterialRequest,
     BatchMaterialResponse,
@@ -46,6 +47,7 @@ from app.services.job_service import create_or_update_job, get_dashboard_metrics
 from app.services.distance import ZIP_CITY_STATE, distance_from_base_zip, infer_zip_from_location
 from app.services.extraction import extract_skills
 from app.services.materials import generate_materials
+from app.services.performance import build_source_weight_map, build_workspace_snapshot
 from app.services.background_refresh import enqueue_refresh
 from app.services.query_cache import invalidate_jobs_query_cache, jobs_query_cache
 from app.services.refresh_state import (
@@ -1514,6 +1516,51 @@ def dashboard(db: Session = Depends(get_db)):
     return DashboardResponse(**get_dashboard_metrics(db))
 
 
+@router.get("/workspace/applied", response_model=AppliedWorkspaceResponse)
+def applied_workspace(
+    limit_jobs: int = Query(default=12, ge=1, le=50),
+    limit_packets: int = Query(default=12, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    snapshot = build_workspace_snapshot(db, limit_jobs=limit_jobs, limit_packets=limit_packets)
+    raw_jobs = [row.get("job") for row in snapshot.get("jobs", []) if isinstance(row.get("job"), Job)]
+    profile = _load_profile_record(db)
+    base_zip = _load_profile_zip(db, profile) or settings.base_zip
+    source_weight_map = build_source_weight_map(db)
+    serialized_jobs = _serialize_rows_with_dynamic_distance(
+        rows=raw_jobs,
+        db=db,
+        base_zip=base_zip,
+        max_distance=None,
+        source_weight_map=source_weight_map,
+    )
+    serialized_by_id = {row.id: row for row in serialized_jobs}
+
+    jobs_payload = []
+    for row in snapshot.get("jobs", []):
+        job = row.get("job")
+        if not isinstance(job, Job):
+            continue
+        serialized = serialized_by_id.get(job.id) or _serialize_job(job)
+        jobs_payload.append(
+            {
+                "job": serialized,
+                "latest_packet_created_at": row.get("latest_packet_created_at"),
+                "latest_packet_generated_via": row.get("latest_packet_generated_via"),
+                "latest_packet_text": row.get("latest_packet_text"),
+                "packet_count": int(row.get("packet_count") or 0),
+                "last_status_event_at": row.get("last_status_event_at"),
+                "last_status_action_source": row.get("last_status_action_source"),
+            }
+        )
+
+    return AppliedWorkspaceResponse(
+        summary=snapshot.get("summary") or {},
+        jobs=jobs_payload,
+        recent_packets=snapshot.get("recent_packets") or [],
+    )
+
+
 @router.get("/export/csv")
 def export_csv(db: Session = Depends(get_db)):
     rows = [_serialize_job(r).model_dump() for r in list_jobs(db, {})]
@@ -1625,6 +1672,7 @@ def rescore_all_jobs(db: Session = Depends(get_db)):
     profile_hobbies = _load_profile_hobbies(db, profile)
     score_tuning_mode = _load_profile_score_tuning_mode(db, profile)
     base_zip = _load_profile_zip(db, profile) or settings.base_zip
+    source_weight_map = build_source_weight_map(db)
     now = datetime.utcnow()
 
     rescored_count = 0
@@ -1672,6 +1720,7 @@ def rescore_all_jobs(db: Session = Depends(get_db)):
             source=job.source or "manual",
             score_tuning_mode=score_tuning_mode,
             profile_hobbies=profile_hobbies,
+            source_performance_weight=source_weight_map.get((job.source or "unknown").lower(), 1.0),
         )
         if prev_interview is not None:
             breakdown["previous_interview_chance_percent"] = prev_interview
@@ -1959,6 +2008,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
         source=job.source or "manual",
         score_tuning_mode=score_tuning_mode,
         profile_hobbies=profile_hobbies,
+        source_performance_weight=source_weight_map.get((job.source or "unknown").lower(), 1.0),
     )
     dynamic_breakdown = _merge_rescore_metadata(dynamic_breakdown, stored_breakdown)
     return _serialize_job(job, score_override=dynamic_score, score_breakdown_override=dynamic_breakdown)
@@ -2298,12 +2348,15 @@ def _serialize_rows_with_dynamic_distance(
     db: Session,
     base_zip: str | None,
     max_distance: float | None,
+    source_weight_map: dict[str, float] | None = None,
 ) -> list[JobRead]:
     profile = _load_profile_record(db)
     profile_skills = _load_profile_skills(db, profile)
     profile_hobbies = _load_profile_hobbies(db, profile)
     score_tuning_mode = _load_profile_score_tuning_mode(db, profile)
+    source_weight_map = build_source_weight_map(db)
     normalized_zip = base_zip.strip() if base_zip else None
+    source_weight_map = source_weight_map or build_source_weight_map(db)
     output: list[JobRead] = []
     for row in rows:
         dynamic_distance = row.distance_miles
@@ -2341,6 +2394,7 @@ def _serialize_rows_with_dynamic_distance(
             source=row.source or "manual",
             score_tuning_mode=score_tuning_mode,
             profile_hobbies=profile_hobbies,
+            source_performance_weight=source_weight_map.get((row.source or "unknown").lower(), 1.0),
         )
         try:
             stored_breakdown = json.loads(row.score_breakdown or "{}")

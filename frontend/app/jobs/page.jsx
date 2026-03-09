@@ -333,6 +333,13 @@ function packetTextFromMaterials(job, materials) {
   return lines.join("\n");
 }
 
+function packetPreviewText(text, maxLength = 180) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "No saved packet yet.";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength).trim()}...`;
+}
+
 async function copyToClipboard(text) {
   if (!text) return false;
   try {
@@ -363,6 +370,9 @@ export default function JobsPage() {
   const [scoreMode, setScoreMode] = useState("balanced");
   const [lastRescoredAt, setLastRescoredAt] = useState("");
   const [refreshStatus, setRefreshStatus] = useState({ last_source_refresh_at: null, scopes: [] });
+  const [appliedWorkspace, setAppliedWorkspace] = useState({ summary: {}, jobs: [], recent_packets: [] });
+  const [loadingWorkspace, setLoadingWorkspace] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
 
   const [localSort, setLocalSort] = useState("expected_value");
   const [nationwideSort, setNationwideSort] = useState("expected_value");
@@ -448,6 +458,19 @@ export default function JobsPage() {
       setRefreshStatus(status || { last_source_refresh_at: null, scopes: [] });
     } catch {
       // Keep UI usable if refresh-state polling fails.
+    }
+  };
+
+  const loadWorkspace = async () => {
+    setLoadingWorkspace(true);
+    setWorkspaceError("");
+    try {
+      const data = await api.getAppliedWorkspace({ limit_jobs: 10, limit_packets: 8 });
+      setAppliedWorkspace(data || { summary: {}, jobs: [], recent_packets: [] });
+    } catch (e) {
+      setWorkspaceError(e.message || "Could not load applied workspace.");
+    } finally {
+      setLoadingWorkspace(false);
     }
   };
 
@@ -679,12 +702,14 @@ export default function JobsPage() {
         if (p?.score_tuning_mode) setScoreMode(String(p.score_tuning_mode).toLowerCase());
         if (p?.last_rescored_at) setLastRescoredAt(p.last_rescored_at);
         void loadRefreshStatus();
+        void loadWorkspace();
         setTimeout(() => {
           loadInitialJobs();
         }, 0);
       })
       .catch(() => {
         void loadRefreshStatus();
+        void loadWorkspace();
         setTimeout(() => {
           loadInitialJobs();
         }, 0);
@@ -693,8 +718,10 @@ export default function JobsPage() {
 
   useEffect(() => {
     void loadRefreshStatus();
+    void loadWorkspace();
     const timer = setInterval(() => {
       void loadRefreshStatus();
+      void loadWorkspace();
     }, 12000);
     return () => clearInterval(timer);
   }, []);
@@ -712,16 +739,28 @@ export default function JobsPage() {
   function applyStatusToLists(ids, status) {
     setLocalJobs((prev) => prev.map((j) => (ids.has(j.id) ? { ...j, status } : j)));
     setNationwideJobs((prev) => prev.map((j) => (ids.has(j.id) ? { ...j, status } : j)));
+    void loadWorkspace();
   }
 
   function removeFromLists(ids) {
     setLocalJobs((prev) => prev.filter((j) => !ids.has(j.id)));
     setNationwideJobs((prev) => prev.filter((j) => !ids.has(j.id)));
+    void loadWorkspace();
   }
 
   function openJobListing(job) {
     if (!job?.url) return;
     window.open(job.url, "_blank", "noopener,noreferrer");
+  }
+
+  async function updateJobStatusAndRefresh(jobId, status, successMessage) {
+    try {
+      await api.updateJob(jobId, { status });
+      applyStatusToLists(new Set([jobId]), status);
+      setNotice(successMessage || `Updated job to ${status}.`);
+    } catch (e) {
+      setNotice(e.message || "Could not update job status.");
+    }
   }
 
   function selectedIdsForPanel(panel, { fallbackToVisible = false } = {}) {
@@ -745,6 +784,7 @@ export default function JobsPage() {
       });
       const text = packetTextFromMaterials(job, materials);
       setSprintPacketById((prev) => ({ ...prev, [job.id]: text }));
+      void loadWorkspace();
       return text;
     } catch (e) {
       const msg = e.message || "Failed to generate apply packet.";
@@ -798,6 +838,7 @@ export default function JobsPage() {
       } else {
         setNotice(`Prepared ${response?.packets?.length || 0} application packet(s).`);
       }
+      void loadWorkspace();
     } catch (e) {
       if (panel === "local") setErrorLocal(e.message || "Could not prepare packets.");
       else setErrorNationwide(e.message || "Could not prepare packets.");
@@ -1375,6 +1416,160 @@ export default function JobsPage() {
           )}
         </CardContent>
       </Card>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Applied Workspace</CardTitle>
+            <CardDescription>
+              Your active pipeline, with the latest saved packet right next to each job so you can move quickly.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">Active jobs</div>
+                <div className="text-xl font-semibold">{Number(appliedWorkspace?.summary?.active_jobs || 0)}</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">Applied jobs</div>
+                <div className="text-xl font-semibold">{Number(appliedWorkspace?.summary?.applied_jobs || 0)}</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">Saved jobs</div>
+                <div className="text-xl font-semibold">{Number(appliedWorkspace?.summary?.saved_jobs || 0)}</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">Follow-up due</div>
+                <div className="text-xl font-semibold">{Number(appliedWorkspace?.summary?.follow_up_due || 0)}</div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">Packet-ready jobs</div>
+                <div className="text-xl font-semibold">{Number(appliedWorkspace?.summary?.packet_ready_jobs || 0)}</div>
+              </div>
+            </div>
+
+            {workspaceError ? <p className="text-sm text-red-600">{workspaceError}</p> : null}
+            {loadingWorkspace ? <p className="text-sm text-muted-foreground">Refreshing workspace...</p> : null}
+
+            {(appliedWorkspace?.jobs || []).length === 0 ? (
+              <p className="text-sm text-muted-foreground">No active pipeline jobs yet. Save or apply to a few jobs and they will show up here.</p>
+            ) : (
+              <div className="space-y-3">
+                {appliedWorkspace.jobs.map((item) => {
+                  const job = item.job;
+                  return (
+                    <div key={`workspace-job-${job.id}`} className="rounded-md border p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <Link href={`/jobs/${job.id}`} className="font-medium text-primary hover:underline">
+                            {job.title}
+                          </Link>
+                          <p className="text-xs text-muted-foreground">
+                            {job.company || "Unknown company"} · {job.location_text || "Location not listed"}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <StatusBadge status={job.status} />
+                          <Badge variant="outline">EV {expectedValueLabel(job)}</Badge>
+                        </div>
+                      </div>
+                      <div className="mt-2 grid gap-2 text-xs text-muted-foreground md:grid-cols-3">
+                        <div>Interview: <span className="font-medium text-foreground">{interviewScore10(job).toFixed(1)}/10</span></div>
+                        <div>Compatibility: <span className="font-medium text-foreground">{compatibilityScore10(job).toFixed(1)}/10</span></div>
+                        <div>Packet count: <span className="font-medium text-foreground">{Number(item.packet_count || 0)}</span></div>
+                        <div>Latest packet: <span className="font-medium text-foreground">{formatDateTime(item.latest_packet_created_at)}</span></div>
+                        <div>Last status update: <span className="font-medium text-foreground">{formatDateTime(item.last_status_event_at)}</span></div>
+                        <div>Follow-up: <span className="font-medium text-foreground">{formatDateTime(job.follow_up_date)}</span></div>
+                      </div>
+                      <p className="mt-2 text-xs text-muted-foreground">{packetPreviewText(item.latest_packet_text)}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {job.url ? (
+                          <Button size="sm" variant="outline" onClick={() => openJobListing(job)}>
+                            Open Listing
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            copyToClipboard(item.latest_packet_text || "").then((ok) =>
+                              setNotice(ok ? "Saved packet copied." : "Could not copy saved packet.")
+                            )
+                          }
+                          disabled={!item.latest_packet_text}
+                        >
+                          Copy Packet
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => updateJobStatusAndRefresh(job.id, "interview", "Marked job as interview.")}
+                        >
+                          Mark Interview
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Packet Drawer</CardTitle>
+            <CardDescription>
+              Recently saved packets so you can reopen, copy, and reuse application materials without digging around.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {(appliedWorkspace?.recent_packets || []).length === 0 ? (
+              <p className="text-sm text-muted-foreground">No saved packets yet. Generate a few packets and they will appear here.</p>
+            ) : (
+              appliedWorkspace.recent_packets.map((packet) => (
+                <div key={`packet-drawer-${packet.id}`} className="rounded-md border p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p className="font-medium">{packet.title}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {packet.company || "Unknown company"} · {formatDateTime(packet.created_at)}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusBadge status={packet.status} />
+                      <Badge variant="outline">{String(packet.generated_via || "saved").replaceAll("_", " ")}</Badge>
+                    </div>
+                  </div>
+                  <p className="mt-2 text-xs text-muted-foreground">{packetPreviewText(packet.packet_text)}</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        copyToClipboard(packet.packet_text || "").then((ok) =>
+                          setNotice(ok ? "Packet copied." : "Could not copy packet.")
+                        )
+                      }
+                    >
+                      Copy Packet
+                    </Button>
+                    <Link href={`/jobs/${packet.job_id}`} className="inline-flex items-center rounded-md border px-3 py-2 text-sm hover:bg-secondary">
+                      Open Job
+                    </Link>
+                    {packet.url ? (
+                      <Button size="sm" variant="outline" onClick={() => window.open(packet.url, "_blank", "noopener,noreferrer")}>
+                        Open Listing
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader>

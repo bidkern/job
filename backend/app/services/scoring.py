@@ -362,8 +362,16 @@ def freshness_score(posted_date: datetime | None) -> float:
     return 0.3
 
 
-def source_score(source: str) -> float:
-    return SOURCE_TRUST.get((source or "").lower(), 0.6)
+def source_score(source: str, source_performance_weight: float | None = None) -> float:
+    base = SOURCE_TRUST.get((source or "").lower(), 0.6)
+    if source_performance_weight is None:
+        return base
+    try:
+        weight = float(source_performance_weight)
+    except (TypeError, ValueError):
+        return base
+    weight = max(0.75, min(1.25, weight))
+    return max(0.25, min(1.0, base * weight))
 
 
 def _seniority_multiplier(
@@ -426,6 +434,7 @@ def score_job(
     weights: dict[str, float] | None = None,
     score_tuning_mode: str = "balanced",
     profile_hobbies: list[str] | None = None,
+    source_performance_weight: float | None = None,
 ) -> tuple[float, dict]:
     weights = weights or DEFAULT_WEIGHTS
     tuning_mode = normalize_score_tuning_mode(score_tuning_mode)
@@ -443,7 +452,8 @@ def score_job(
     distance_value = distance_score(distance_miles, remote_type)
     salary_value = salary_score(pay_min, pay_max)
     freshness_value = freshness_score(posted_date)
-    source_value = source_score(source)
+    static_source_value = source_score(source)
+    source_value = source_score(source, source_performance_weight=source_performance_weight)
 
     legacy_total = (
         weights["role"] * role_value
@@ -623,6 +633,8 @@ def score_job(
             "salary": round(salary_value, 4),
             "freshness": round(freshness_value, 4),
             "source": round(source_value, 4),
+            "source_static": round(static_source_value, 4),
+            "source_auto_weight": round(float(source_performance_weight or 1.0), 4),
             "seniority_multiplier": round(seniority_multiplier, 4),
         },
         "hobby_signals": {
@@ -642,6 +654,11 @@ def score_job(
             "realness_risk": round(float(decision_metrics.get("realness_risk") or 0.0), 4),
             "penalty_reasons": list(decision_metrics.get("quality_penalty_reasons") or []),
         },
+        "source_signals": {
+            "static_trust": round(static_source_value, 4),
+            "effective_trust": round(source_value, 4),
+            "auto_weight": round(float(source_performance_weight or 1.0), 4),
+        },
         "seniority_signal": seniority_signal,
         "matched_role_categories": matched_roles,
         "why_ranked_high": [
@@ -660,6 +677,15 @@ def score_job(
             ),
             seniority_reason,
             hobby_reason,
+            (
+                "Source historically converts well, so it received a small boost"
+                if float(source_performance_weight or 1.0) >= 1.05
+                else (
+                    "Source has weaker tracked outcomes, so it was slightly deprioritized"
+                    if float(source_performance_weight or 1.0) <= 0.95
+                    else "Source performance is currently neutral"
+                )
+            ),
             (
                 f"Quality penalties: {', '.join(decision_metrics.get('quality_penalty_reasons') or [])}"
                 if decision_metrics.get("quality_penalty_reasons")

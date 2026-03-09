@@ -101,7 +101,9 @@ export default function DashboardPage() {
             {topSource ? (
               <div className="rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground">
                 Best source right now: <span className="font-medium text-foreground">{prettyLabel(topSource.source)}</span>{" "}
-                with {Number(topSource.response_rate || 0).toFixed(1)}% response rate and {Number(topSource.avg_expected_value || 0).toFixed(1)} average EV.
+                with {Number(topSource.response_rate || 0).toFixed(1)}% response rate,{" "}
+                {Number(topSource.avg_expected_value || 0).toFixed(1)} average EV, and{" "}
+                {Number(topSource.auto_weight || 1).toFixed(2)}x source weight.
               </div>
             ) : null}
           </CardContent>
@@ -129,8 +131,11 @@ export default function DashboardPage() {
                     <div>Interview rate: <span className="font-medium">{Number(row.interview_rate || 0).toFixed(1)}%</span></div>
                     <div>Response rate: <span className="font-medium">{Number(row.response_rate || 0).toFixed(1)}%</span></div>
                     <div>Offers: <span className="font-medium">{row.offer_count}</span></div>
+                    <div>Offer rate: <span className="font-medium">{Number(row.offer_rate || 0).toFixed(1)}%</span></div>
                     <div>Avg final: <span className="font-medium">{Number(row.avg_final_score || 0).toFixed(1)}</span></div>
                     <div>Avg EV: <span className="font-medium">{Number(row.avg_expected_value || 0).toFixed(1)}</span></div>
+                    <div>Auto weight: <span className="font-medium">{Number(row.auto_weight || 1).toFixed(2)}x</span></div>
+                    <div>Priority tier: <span className="font-medium">{prettyLabel(row.priority_tier)}</span></div>
                   </div>
                 </div>
               ))
@@ -157,6 +162,66 @@ export default function DashboardPage() {
                     <p className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</p>
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">Source: {prettyLabel(event.action_source)}</p>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Role Family Conversion</CardTitle>
+            <CardDescription>Which role families are actually getting traction once you apply.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {(data?.role_family_performance || []).length === 0 ? (
+              <p className="text-muted-foreground">Not enough role-family history yet.</p>
+            ) : (
+              data.role_family_performance.map((row) => (
+                <div key={row.role_family} className="rounded-md border p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-medium">{prettyLabel(row.role_family)}</p>
+                    <p className="text-xs text-muted-foreground">{row.total_jobs} jobs</p>
+                  </div>
+                  <div className="mt-2 grid gap-2 text-xs md:grid-cols-3">
+                    <div>Applied: <span className="font-medium">{row.applied_count}</span></div>
+                    <div>Interviews: <span className="font-medium">{row.interview_count}</span></div>
+                    <div>Offers: <span className="font-medium">{row.offer_count}</span></div>
+                    <div>Response rate: <span className="font-medium">{Number(row.response_rate || 0).toFixed(1)}%</span></div>
+                    <div>Offer rate: <span className="font-medium">{Number(row.offer_rate || 0).toFixed(1)}%</span></div>
+                    <div>Avg EV: <span className="font-medium">{Number(row.avg_expected_value || 0).toFixed(1)}</span></div>
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Score-to-Outcome Conversion</CardTitle>
+            <CardDescription>How score bands are translating into interviews and offers.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {(data?.score_band_analytics || []).length === 0 ? (
+              <p className="text-muted-foreground">No score-band analytics yet.</p>
+            ) : (
+              data.score_band_analytics.map((row) => (
+                <div key={row.band_label} className="rounded-md border p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-medium">{row.band_label}</p>
+                    <p className="text-xs text-muted-foreground">{row.job_count} jobs</p>
+                  </div>
+                  <div className="mt-2 grid gap-2 text-xs md:grid-cols-3">
+                    <div>Applied: <span className="font-medium">{row.applied_count}</span></div>
+                    <div>Interviews: <span className="font-medium">{row.interview_count}</span></div>
+                    <div>Offers: <span className="font-medium">{row.offer_count}</span></div>
+                    <div>Interview rate: <span className="font-medium">{Number(row.interview_rate || 0).toFixed(1)}%</span></div>
+                    <div>Offer rate: <span className="font-medium">{Number(row.offer_rate || 0).toFixed(1)}%</span></div>
+                    <div>Score range: <span className="font-medium">{Number(row.min_score || 0).toFixed(0)}-{Number(row.max_score || 0).toFixed(0)}</span></div>
+                  </div>
                 </div>
               ))
             )}

@@ -6,12 +6,19 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.job import Job
-from app.models.job_packet_history import JobPacketHistory
-from app.models.job_status_event import JobStatusEvent
 from app.models.profile import UserProfile
 from app.services.dedupe import extract_external_job_keys, is_probable_duplicate
 from app.services.distance import distance_from_base_zip, infer_zip_from_location
 from app.services.extraction import extract_keywords, extract_skills
+from app.services.performance import (
+    APPLIED_LIKE_STATUSES,
+    RESPONSE_STATUSES,
+    build_packet_metrics,
+    build_recent_activity_rows,
+    build_role_family_performance_rows,
+    build_score_band_analytics_rows,
+    build_source_performance_rows,
+)
 from app.services.scoring import normalize_score_tuning_mode, score_job
 
 
@@ -394,101 +401,14 @@ def get_dashboard_metrics(db: Session) -> dict:
     weekly = {k: v for k, v in weekly_rows if k}
 
     jobs = db.scalars(select(Job)).all()
-    applied_like_statuses = {"applied", "interview", "final_round", "offer", "declined", "no_response"}
-    response_statuses = {"interview", "final_round", "offer"}
-    offer_statuses = {"offer"}
+    source_performance = build_source_performance_rows(jobs)
+    role_family_performance = build_role_family_performance_rows(jobs)
+    score_band_analytics = build_score_band_analytics_rows(jobs)
+    recent_activity = build_recent_activity_rows(db, limit=10)
+    packet_metrics = build_packet_metrics(db)
 
-    source_rollup: dict[str, dict[str, float | int | str]] = {}
-    for job in jobs:
-        source = (job.source or "unknown").lower()
-        bucket = source_rollup.setdefault(
-            source,
-            {
-                "source": source,
-                "total_jobs": 0,
-                "active_pipeline": 0,
-                "applied_count": 0,
-                "interview_count": 0,
-                "offer_count": 0,
-                "response_rate": 0.0,
-                "interview_rate": 0.0,
-                "avg_final_score": 0.0,
-                "avg_expected_value": 0.0,
-                "_score_sum": 0.0,
-                "_expected_value_sum": 0.0,
-            },
-        )
-        bucket["total_jobs"] = int(bucket["total_jobs"]) + 1
-        status = (job.status or "new").lower()
-        if status in {"saved", "applied", "interview", "final_round", "offer"}:
-            bucket["active_pipeline"] = int(bucket["active_pipeline"]) + 1
-        if status in applied_like_statuses:
-            bucket["applied_count"] = int(bucket["applied_count"]) + 1
-        if status in response_statuses:
-            bucket["interview_count"] = int(bucket["interview_count"]) + 1
-        if status in offer_statuses:
-            bucket["offer_count"] = int(bucket["offer_count"]) + 1
-        try:
-            breakdown = json.loads(job.score_breakdown or "{}")
-        except json.JSONDecodeError:
-            breakdown = {}
-        decision = breakdown.get("decision") if isinstance(breakdown, dict) else {}
-        if not isinstance(decision, dict):
-            decision = {}
-        final_score = decision.get("final_weighted_score", breakdown.get("total", job.score))
-        expected_value = decision.get("expected_value_score", breakdown.get("expected_value_score"))
-        bucket["_score_sum"] = float(bucket["_score_sum"]) + float(final_score or 0.0)
-        bucket["_expected_value_sum"] = float(bucket["_expected_value_sum"]) + float(expected_value or 0.0)
-
-    source_performance: list[dict[str, float | int | str]] = []
-    for bucket in source_rollup.values():
-        total_jobs = max(1, int(bucket["total_jobs"]))
-        applied_count = int(bucket["applied_count"])
-        interview_count = int(bucket["interview_count"])
-        bucket["response_rate"] = round((interview_count / applied_count) * 100, 1) if applied_count else 0.0
-        bucket["interview_rate"] = round((interview_count / total_jobs) * 100, 1)
-        bucket["avg_final_score"] = round(float(bucket["_score_sum"]) / total_jobs, 1)
-        bucket["avg_expected_value"] = round(float(bucket["_expected_value_sum"]) / total_jobs, 1)
-        bucket.pop("_score_sum", None)
-        bucket.pop("_expected_value_sum", None)
-        source_performance.append(bucket)
-    source_performance.sort(
-        key=lambda row: (
-            -float(row["response_rate"]),
-            -int(row["offer_count"]),
-            -float(row["avg_expected_value"]),
-            -int(row["total_jobs"]),
-        )
-    )
-
-    recent_status_rows = db.scalars(
-        select(JobStatusEvent).order_by(JobStatusEvent.created_at.desc()).limit(10)
-    ).all()
-    recent_activity = [
-        {
-            "id": row.id,
-            "job_id": row.job_id,
-            "previous_status": row.previous_status,
-            "new_status": row.new_status,
-            "action_source": row.action_source,
-            "note": row.note,
-            "created_at": row.created_at,
-        }
-        for row in recent_status_rows
-    ]
-
-    packet_rows = db.scalars(select(JobPacketHistory).order_by(JobPacketHistory.created_at.desc())).all()
-    total_packets = len(packet_rows)
-    last_packet_at = packet_rows[0].created_at if packet_rows else None
-    packets_last_7_days = 0
-    if packet_rows and last_packet_at:
-        threshold = datetime.utcnow().timestamp() - (7 * 24 * 60 * 60)
-        packets_last_7_days = sum(
-            1 for row in packet_rows if row.created_at and row.created_at.timestamp() >= threshold
-        )
-
-    response_count = sum(v for k, v in by_status.items() if (k or "").lower() in response_statuses)
-    applied_count_total = sum(v for k, v in by_status.items() if (k or "").lower() in applied_like_statuses)
+    response_count = sum(v for k, v in by_status.items() if (k or "").lower() in RESPONSE_STATUSES)
+    applied_count_total = sum(v for k, v in by_status.items() if (k or "").lower() in APPLIED_LIKE_STATUSES)
     response_rate = round((response_count / applied_count_total) * 100, 1) if applied_count_total else 0.0
 
     return {
@@ -498,10 +418,8 @@ def get_dashboard_metrics(db: Session) -> dict:
         "outcome_counts": by_status,
         "response_rate": response_rate,
         "source_performance": source_performance[:8],
+        "role_family_performance": role_family_performance[:8],
+        "score_band_analytics": score_band_analytics,
         "recent_activity": recent_activity,
-        "packet_metrics": {
-            "total_generated": total_packets,
-            "generated_last_7_days": packets_last_7_days,
-            "last_generated_at": last_packet_at,
-        },
+        "packet_metrics": packet_metrics,
     }

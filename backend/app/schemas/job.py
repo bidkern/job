@@ -161,14 +161,77 @@ class SourcePerformanceRead(BaseModel):
     offer_count: int = 0
     response_rate: float = 0.0
     interview_rate: float = 0.0
+    offer_rate: float = 0.0
     avg_final_score: float = 0.0
     avg_expected_value: float = 0.0
+    auto_weight: float = 1.0
+    priority_tier: str = "neutral"
+
+
+class RoleFamilyPerformanceRead(BaseModel):
+    role_family: str
+    total_jobs: int = 0
+    applied_count: int = 0
+    interview_count: int = 0
+    offer_count: int = 0
+    response_rate: float = 0.0
+    offer_rate: float = 0.0
+    avg_final_score: float = 0.0
+    avg_expected_value: float = 0.0
+
+
+class ScoreBandAnalyticsRead(BaseModel):
+    band_label: str
+    min_score: float = 0.0
+    max_score: float = 0.0
+    job_count: int = 0
+    applied_count: int = 0
+    interview_count: int = 0
+    offer_count: int = 0
+    interview_rate: float = 0.0
+    offer_rate: float = 0.0
 
 
 class PacketMetricsRead(BaseModel):
     total_generated: int = 0
     generated_last_7_days: int = 0
     last_generated_at: datetime | None = None
+
+
+class AppliedWorkspaceSummaryRead(BaseModel):
+    active_jobs: int = 0
+    applied_jobs: int = 0
+    saved_jobs: int = 0
+    follow_up_due: int = 0
+    packet_ready_jobs: int = 0
+
+
+class AppliedWorkspaceJobRead(BaseModel):
+    job: JobRead
+    latest_packet_created_at: datetime | None = None
+    latest_packet_generated_via: str | None = None
+    latest_packet_text: str | None = None
+    packet_count: int = 0
+    last_status_event_at: datetime | None = None
+    last_status_action_source: str | None = None
+
+
+class PacketDrawerItemRead(BaseModel):
+    id: int
+    job_id: int
+    title: str
+    company: str | None = None
+    status: str = "unknown"
+    url: str | None = None
+    packet_text: str
+    generated_via: str = "single"
+    created_at: datetime
+
+
+class AppliedWorkspaceResponse(BaseModel):
+    summary: AppliedWorkspaceSummaryRead = Field(default_factory=AppliedWorkspaceSummaryRead)
+    jobs: list[AppliedWorkspaceJobRead] = Field(default_factory=list)
+    recent_packets: list[PacketDrawerItemRead] = Field(default_factory=list)
 
 
 class IngestRequest(BaseModel):
@@ -227,6 +290,8 @@ class DashboardResponse(BaseModel):
     outcome_counts: dict[str, int] = Field(default_factory=dict)
     response_rate: float = 0.0
     source_performance: list[SourcePerformanceRead] = Field(default_factory=list)
+    role_family_performance: list[RoleFamilyPerformanceRead] = Field(default_factory=list)
+    score_band_analytics: list[ScoreBandAnalyticsRead] = Field(default_factory=list)
     recent_activity: list[StatusEventRead] = Field(default_factory=list)
     packet_metrics: PacketMetricsRead = Field(default_factory=PacketMetricsRead)
 

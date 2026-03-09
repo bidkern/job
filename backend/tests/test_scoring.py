@@ -212,3 +212,34 @@ def test_staffing_language_increases_realness_risk():
     staffing_risk = staffing_breakdown["quality_signals"]["realness_risk"]
     assert staffing_risk > direct_risk
     assert any("staffing" in reason.lower() for reason in staffing_breakdown["quality_signals"]["penalty_reasons"])
+
+
+def test_source_performance_weight_adjusts_source_component():
+    _, neutral = score_job(
+        title="Operations Coordinator",
+        description="Coordinate reporting, inventory, and customer communication.",
+        job_skills=["operations", "inventory", "reporting"],
+        profile_skills=["inventory", "customer service", "communication", "operations"],
+        distance_miles=10,
+        remote_type="onsite",
+        pay_min=48000,
+        pay_max=56000,
+        posted_date=datetime.now(timezone.utc) - timedelta(days=2),
+        source="adzuna",
+        source_performance_weight=1.0,
+    )
+    _, boosted = score_job(
+        title="Operations Coordinator",
+        description="Coordinate reporting, inventory, and customer communication.",
+        job_skills=["operations", "inventory", "reporting"],
+        profile_skills=["inventory", "customer service", "communication", "operations"],
+        distance_miles=10,
+        remote_type="onsite",
+        pay_min=48000,
+        pay_max=56000,
+        posted_date=datetime.now(timezone.utc) - timedelta(days=2),
+        source="adzuna",
+        source_performance_weight=1.15,
+    )
+    assert boosted["components"]["source"] > neutral["components"]["source"]
+    assert boosted["source_signals"]["auto_weight"] == 1.15
