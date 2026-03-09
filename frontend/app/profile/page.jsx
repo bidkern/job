@@ -176,6 +176,9 @@ export default function ProfilePage() {
             <input type="file" accept=".pdf,.doc,.docx,.txt" onChange={onResumeUpload} />
             {profile.resume_filename ? <span className="text-xs text-muted-foreground">Current: {profile.resume_filename}</span> : null}
           </div>
+          <p className="md:col-span-2 text-xs text-muted-foreground">
+            Uploading a new resume replaces the previous resume-based skill signal used for scoring. You can still edit skills manually below if needed.
+          </p>
 
           <div className="md:col-span-2 flex flex-wrap gap-2">
             <Button onClick={saveProfile}>Save Profile</Button>

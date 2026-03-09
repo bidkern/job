@@ -108,9 +108,8 @@ async def upload_resume(file: UploadFile = File(...), db: Session = Depends(get_
     extracted_count = 0
     if resume_text:
         extracted = extract_skills(resume_text)
-        existing = json.loads(profile.skills_json or "[]")
-        merged = sorted(set([*(existing or []), *extracted]))
-        profile.skills_json = json.dumps(merged)
+        # A new resume should replace the previous resume-derived signal, not accumulate older versions.
+        profile.skills_json = json.dumps(sorted(set(extracted)))
         extracted_count = len(extracted)
     else:
         warning = (
